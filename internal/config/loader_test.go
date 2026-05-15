@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -41,8 +42,15 @@ func TestLoadJSON(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if cfg.APIKey != "test-key-123" {
-		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "test-key-123")
+	// Legacy api_key field is auto-migrated into APIKeys[0] and cleared.
+	if cfg.APIKey != "" {
+		t.Errorf("APIKey should be cleared after migration, got %q", cfg.APIKey)
+	}
+	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0].Token != "test-key-123" {
+		t.Errorf("APIKeys mismatch: %+v", cfg.APIKeys)
+	}
+	if cfg.APIKeys[0].Account != "legacy" {
+		t.Errorf("APIKeys[0].Account = %q, want legacy", cfg.APIKeys[0].Account)
 	}
 	if cfg.Host != "0.0.0.0" {
 		t.Errorf("Host = %q, want %q", cfg.Host, "0.0.0.0")
@@ -116,8 +124,12 @@ func TestEnvOverrides(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if cfg.APIKey != "env-key" {
-		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "env-key")
+	// env override sets APIKey, then migration moves it into APIKeys[0] and clears APIKey.
+	if cfg.APIKey != "" {
+		t.Errorf("APIKey should be cleared after migration, got %q", cfg.APIKey)
+	}
+	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0].Token != "env-key" {
+		t.Errorf("APIKeys after env-override migration: %+v", cfg.APIKeys)
 	}
 	if cfg.Host != "env-host" {
 		t.Errorf("Host = %q, want %q", cfg.Host, "env-host")
@@ -178,6 +190,155 @@ func TestInterpolateEnvVars(t *testing.T) {
 	want := `{"api_key": "my-secret-value", "host": "${UNSET_VAR:-fallback}"}`
 	if result != want {
 		t.Errorf("interpolateEnvVars() = %q, want %q", result, want)
+	}
+}
+
+func TestMigrate_LegacyAPIKeyWrapsAndBacksUp(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	originalJSON := `{"api_key": "sk-legacy-xyz", "host": "127.0.0.1"}`
+	if err := os.WriteFile(cfgPath, []byte(originalJSON), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer os.Unsetenv("OC_GO_CC_CONFIG")
+	oldEnvKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer os.Setenv("OC_GO_CC_API_KEY", oldEnvKey)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.APIKey != "" {
+		t.Errorf("legacy APIKey should be cleared, got %q", cfg.APIKey)
+	}
+	if len(cfg.APIKeys) != 1 || cfg.APIKeys[0].Token != "sk-legacy-xyz" {
+		t.Errorf("APIKeys mismatch: %+v", cfg.APIKeys)
+	}
+
+	// Backup file exists.
+	matches, _ := filepath.Glob(cfgPath + ".backup.*")
+	if len(matches) != 1 {
+		t.Errorf("expected one backup file, got %d: %v", len(matches), matches)
+	}
+
+	// Backup contains the original legacy shape.
+	backupData, _ := os.ReadFile(matches[0])
+	if !strings.Contains(string(backupData), `"api_key": "sk-legacy-xyz"`) {
+		t.Errorf("backup missing original api_key: %s", backupData)
+	}
+
+	// Persisted config now has api_keys[] and no api_key field.
+	persisted, _ := os.ReadFile(cfgPath)
+	if strings.Contains(string(persisted), `"api_key":`) && !strings.Contains(string(persisted), `"api_keys":`) {
+		t.Errorf("persisted should have api_keys, not api_key: %s", persisted)
+	}
+}
+
+func TestMigrate_Idempotent(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	originalJSON := `{"api_keys": [{"token": "sk-1", "account": "primary"}]}`
+	if err := os.WriteFile(cfgPath, []byte(originalJSON), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer os.Unsetenv("OC_GO_CC_CONFIG")
+	oldEnvKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer os.Setenv("OC_GO_CC_API_KEY", oldEnvKey)
+
+	_, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// No backup file should have been written (migration was a no-op).
+	matches, _ := filepath.Glob(cfgPath + ".backup.*")
+	if len(matches) != 0 {
+		t.Errorf("idempotent migration should not write backup, got %d files", len(matches))
+	}
+}
+
+func TestFreeFallback_DefaultsInjected(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	originalJSON := `{"api_keys": [{"token": "sk-1", "account": "primary"}]}`
+	_ = os.WriteFile(cfgPath, []byte(originalJSON), 0o644)
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer os.Unsetenv("OC_GO_CC_CONFIG")
+	oldEnvKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer os.Setenv("OC_GO_CC_API_KEY", oldEnvKey)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.FreeFallback.BaseURL != defaultFreeFallbackBaseURL {
+		t.Errorf("BaseURL = %q, want %q", cfg.FreeFallback.BaseURL, defaultFreeFallbackBaseURL)
+	}
+	if len(cfg.FreeFallback.Models) != len(defaultFreeFallbackModels) {
+		t.Errorf("Models count = %d, want %d", len(cfg.FreeFallback.Models), len(defaultFreeFallbackModels))
+	}
+	if cfg.FreeFallback.Models[0] != "deepseek-v4-flash-free" {
+		t.Errorf("first free model = %q, want deepseek-v4-flash-free", cfg.FreeFallback.Models[0])
+	}
+}
+
+func TestFreeFallback_UserOverrideRespected(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	originalJSON := `{
+		"api_keys": [{"token": "sk-1", "account": "primary"}],
+		"free_fallback": {
+			"base_url": "https://custom/v1",
+			"models": ["custom-model-free"]
+		}
+	}`
+	_ = os.WriteFile(cfgPath, []byte(originalJSON), 0o644)
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer os.Unsetenv("OC_GO_CC_CONFIG")
+	oldEnvKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer os.Setenv("OC_GO_CC_API_KEY", oldEnvKey)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.FreeFallback.BaseURL != "https://custom/v1" {
+		t.Errorf("user override not respected: got %q", cfg.FreeFallback.BaseURL)
+	}
+	if len(cfg.FreeFallback.Models) != 1 || cfg.FreeFallback.Models[0] != "custom-model-free" {
+		t.Errorf("user models override not respected: %+v", cfg.FreeFallback.Models)
+	}
+}
+
+func TestValidate_RejectsEmptyKeyEntries(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	// Key with empty token — should fail validation.
+	originalJSON := `{"api_keys": [{"token": "", "account": "broken"}]}`
+	_ = os.WriteFile(cfgPath, []byte(originalJSON), 0o644)
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer os.Unsetenv("OC_GO_CC_CONFIG")
+	oldEnvKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer os.Setenv("OC_GO_CC_API_KEY", oldEnvKey)
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected validation error for empty token")
 	}
 }
 

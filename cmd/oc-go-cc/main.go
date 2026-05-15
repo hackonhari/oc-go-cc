@@ -41,6 +41,7 @@ Configuration is stored at ~/.config/oc-go-cc/config.json`,
 	rootCmd.AddCommand(validateCmd())
 	rootCmd.AddCommand(modelsCmd())
 	rootCmd.AddCommand(autostartCmd())
+	rootCmd.AddCommand(keysStatusCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -248,8 +249,15 @@ func validateCmd() *cobra.Command {
 			fmt.Printf("  Port: %d\n", cfg.Port)
 			fmt.Printf("  API Key: %s...\n", maskString(cfg.APIKey, 8))
 			fmt.Printf("  Base URL: %s\n", cfg.OpenCodeGo.BaseURL)
-			fmt.Printf("  Models configured: %d\n", len(cfg.Models))
-			fmt.Printf("  Fallback chains: %d\n", len(cfg.Fallbacks))
+			if cfg.HasNewSchema() {
+				fmt.Printf("  Default model: %s\n", cfg.DefaultModel)
+				fmt.Printf("  Aliases: %d\n", len(cfg.ModelAliases))
+				fmt.Printf("  Model configs: %d\n", len(cfg.ModelConfigs))
+				fmt.Printf("  Fallback chain: %d models\n", len(cfg.Fallbacks))
+			} else {
+				fmt.Printf("  Models configured (legacy): %d\n", len(cfg.Models))
+				fmt.Printf("  Fallback chains (legacy): %d\n", len(cfg.FallbacksLegacy))
+			}
 			return nil
 		},
 	}

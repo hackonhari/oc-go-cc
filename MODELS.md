@@ -4,6 +4,154 @@ Comprehensive guide to OpenCode Go models with capabilities, costs, and routing 
 
 **Source:** [OpenCode Go Documentation](https://opencode.ai/docs/go/)
 
+---
+
+## Phase 1 Architecture (2026-05-15+): Key Pool + Zen Free Fallback
+
+oc-go-cc now manages a **pool of paid OpenCode Go API keys** with automatic rotation on exhaustion, and falls through to **anonymous Zen free models** when all paid keys are dry. This replaces the prior single-key `-pr ocgo` + `-pr ocgo-hk` two-proxy setup.
+
+### Configuration (~/.config/oc-go-cc/config.json)
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 3456,
+  "api_keys": [
+    {"token": "sk-...", "account": "ocgo-primary"},
+    {"token": "sk-...", "account": "ocgo-hk"},
+    {"token": "sk-...", "account": "ocgo-3-fresh"}
+  ],
+  "free_fallback": {
+    "base_url": "https://opencode.ai/zen/v1",
+    "models": ["deepseek-v4-flash-free", "qwen3.6-plus-free", "minimax-m2.5-free"]
+  },
+  "default_model": "deepseek-v4-pro",
+  "model_aliases": {...},
+  "opencode_go": {...}
+}
+```
+
+Legacy `api_key: "${OC_GO_CC_API_KEY}"` is auto-migrated to `api_keys[0]` on first startup with a `config.json.backup.<unix-ts>` written.
+
+### State file (~/.config/oc-go-cc/key-states.json)
+
+Runtime mirror of the pool with per-key state:
+
+```json
+{
+  "api_keys": [
+    {
+      "token": "sk-...", "account": "ocgo-primary",
+      "exhaustedAt": "2026-05-15T11:54:40Z",
+      "resetDate": "2026-06-14T00:00:00Z",
+      "lastUsed": "2026-05-15T11:54:40Z",
+      "weeklyUsagePercent": null,
+      "monthlyUsagePercent": null
+    }
+  ],
+  "free_fallback": {...}
+}
+```
+
+Editable directly — the proxy hot-reloads every 60s. Atomic writes (tmp+rename), RWMutex-guarded.
+
+### Rotation behavior
+
+| Upstream response | Behavior |
+|---|---|
+| 200 | Success, key remains active, `LastUsed` updated |
+| **401 + `CreditsError` body** | Monthly cap hit. Mark exhausted, rotate to next key. |
+| **429 + quota keywords in body** | Hard rotate. |
+| 429 + `Retry-After ≤60s` + benign body | Transient throttle: retry SAME key after backoff (max 2 retries) |
+| 429 + `Retry-After >60s` | Hard rotate. |
+| 429 + no header + no quota body | Ambiguous → treated as hard (safer). |
+| 5xx | NOT key's fault: return as-is, pool unchanged. |
+
+When **all paid keys exhausted**: handler engages `freepool.Resolver`, hits `opencode.ai/zen/v1` anonymously with first model in `free_fallback.models`. On free model failure, tries next. All free models failed → structured 502 with `next_reset` date.
+
+### Free fallback model catalog
+
+Free models on Zen are anonymous (no auth header required), $0 cost. Verified live 2026-05-15:
+
+| Model ID | Endpoint format | Use |
+|---|---|---|
+| `deepseek-v4-flash-free` | `/chat/completions` | Recommended default — mirrors paid Flash family |
+| `qwen3.6-plus-free` | `/chat/completions` | Strong coding |
+| `minimax-m2.5-free` | `/messages` | Long context |
+| `big-pickle` | `/chat/completions` | Reasoning |
+| `nemotron-3-super-free` | `/chat/completions` | Nvidia reasoning |
+| `ring-2.6-1t-free` | `/chat/completions` | 1T params |
+| `trinity-large-preview-free` | `/chat/completions` | Preview |
+
+### Dual-endpoint paths
+
+```
+POST /v1/messages              → paid pool with rotation → free fallback on exhaustion
+POST /v1/chat/completions      → same
+POST /free/v1/messages         → SKIPS paid pool, goes straight to free models (mode=forced)
+POST /free/v1/chat/completions → same
+GET  /health                   → liveness check
+```
+
+### `hh-cd --free` flag
+
+`hh-cd -pr ocgo --free` appends `/free` to `ANTHROPIC_BASE_URL`, routing all session traffic to the free-only path. Refuses with non-`ocgo` providers. `--model NAME` works in both modes:
+- Paid mode: `--model X` honored upstream
+- Free mode: `--model X` honored IF X is a recognized free-tier model (suffix `-free` or `big-pickle`); else falls back to configured chain order
+
+### Operations
+
+```bash
+oc-go-cc keys-status                # table view (tokens redacted)
+oc-go-cc keys-status --tail         # last 50 rotation events
+oc-go-cc keys-status --tail --lines 200
+oc-go-cc keys-status --json         # structured (tokens redacted)
+```
+
+Rotation event log: `~/.cache/oc-go-cc/rotation-YYYYMMDD.log` (JSONL, daily-rotated by filename). Event types: `key_acquired`, `key_exhausted_hard`, `key_throttle_transient`, `key_reset_autoclear`, `free_fallback_engaged` (with `mode: forced|fallback`), `free_fallback_model_failed`, `all_exhausted_502`.
+
+### Adding a new account
+
+Append to `~/.config/oc-go-cc/key-states.json` → `api_keys[]`. Hot-reload picks it up within 60s.
+
+```json
+{
+  "token": "sk-new-token-here",
+  "account": "ocgo-4",
+  "resetDate": "2026-07-01T00:00:00Z"
+}
+```
+
+OR edit `config.json` → `api_keys[]` and restart the proxy.
+
+### Rollback procedure
+
+Phase 1 deployment 2026-05-15 wrote a timestamped backup bundle. To revert:
+
+```bash
+~/.local/bin/oc-go-cc stop
+cp ~/.config/oc-go-cc/config.json.backup.20260515-115229 ~/.config/oc-go-cc/config.json
+cp ~/.config/oc-go-cc/config-hk.json.backup.20260515-115229 ~/.config/oc-go-cc/config-hk.json
+cp ~/.claude/ocgo.env.backup.20260515-115229 ~/.claude/ocgo.env
+cp ~/.claude/ocgo-hk.env.backup.20260515-115229 ~/.claude/ocgo-hk.env
+rm ~/.local/bin/oc-go-cc
+cp ~/.local/bin/oc-go-cc.bin.pre-rotation ~/.local/bin/oc-go-cc
+~/.local/bin/oc-go-cc serve --background
+~/.local/bin/oc-go-cc serve --background --config ~/.config/oc-go-cc/config-hk.json
+```
+
+Old binary kept until 2026-05-22 then can be removed.
+
+### Decommissioned by Phase 1
+
+- `~/.config/oc-go-cc/config-hk.json` — merged into unified `api_keys[]`
+- `~/.claude/ocgo-hk.env` — `-pr ocgo-hk` no longer needed
+- Second proxy instance on port 3457 — single proxy on 3456 owns all keys
+- `hh-cd -pr ocgo-hk` — error on use (env file gone)
+
+---
+
+
 ## Quick Cost Comparison
 
 > 💰 **Cost-conscious routing matters!** GLM-5.1 gives you 880 requests per 5-hour block, while Qwen3.5 Plus gives you **10,200** — that's **11.6x more requests** for the same $12 budget.
