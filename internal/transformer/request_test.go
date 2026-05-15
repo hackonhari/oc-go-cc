@@ -267,12 +267,13 @@ func TestTransformRequestAppliesReasoningEffortAndThinking(t *testing.T) {
 	}
 }
 
-func TestTransformRequestStripsReasoningEffortWhenNoThinkingHistory(t *testing.T) {
+func TestTransformRequestHonorsThinkingConfigOnFirstRequest(t *testing.T) {
 	transformer := NewRequestTransformer()
 
-	// When the conversation history has NO thinking blocks, reasoning_effort
-	// and thinking should be stripped to avoid DeepSeek's validation error:
-	// "The reasoning_content in the thinking mode must be passed back to the API."
+	// New behavior: when the model config has thinking enabled, we send
+	// thinking params upstream regardless of whether history contains thinking
+	// blocks. The DeepSeek round-trip issue is solved by injecting placeholder
+	// reasoning_content on assistant messages in transformAssistantMessage.
 	req := &types.MessageRequest{
 		Model:     "claude-test",
 		MaxTokens: 256,
@@ -291,13 +292,26 @@ func TestTransformRequestStripsReasoningEffortWhenNoThinkingHistory(t *testing.T
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
 
-	if openaiReq.ReasoningEffort != nil {
-		t.Fatalf("ReasoningEffort = %v, want nil (stripped because no thinking history)", *openaiReq.ReasoningEffort)
+	if openaiReq.ReasoningEffort == nil || *openaiReq.ReasoningEffort != "max" {
+		t.Fatalf("ReasoningEffort should be 'max' to honor model config, got %v", openaiReq.ReasoningEffort)
 	}
-	// We explicitly send thinking: {"type":"disabled"} so DeepSeek knows
-	// not to require reasoning_content on assistant messages.
-	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
-		t.Fatalf("Thinking = %s, want %s", got, want)
+	if got, want := string(openaiReq.Thinking), `{"type":"enabled"}`; got != want {
+		t.Fatalf("Thinking should be enabled per model config, got %s, want %s", got, want)
+	}
+
+	// Assistant message must have placeholder reasoning_content for DeepSeek.
+	var assistantMsg *types.ChatMessage
+	for i := range openaiReq.Messages {
+		if openaiReq.Messages[i].Role == "assistant" {
+			assistantMsg = &openaiReq.Messages[i]
+			break
+		}
+	}
+	if assistantMsg == nil {
+		t.Fatal("expected assistant message in transformed request")
+	}
+	if assistantMsg.ReasoningContent == nil {
+		t.Fatal("expected placeholder reasoning_content on assistant message")
 	}
 }
 

@@ -34,8 +34,12 @@ type ChatMessage struct {
 
 // ToolCall represents a function call made by the model.
 type ToolCall struct {
-	ID       string       `json:"id"`
-	Type     string       `json:"type"`
+	// Index identifies which tool_call this delta belongs to in streaming responses.
+	// Subsequent argument fragments share the same index. Pointer so non-streaming
+	// (where index is absent) doesn't accidentally collide on zero.
+	Index    *int         `json:"index,omitempty"`
+	ID       string       `json:"id,omitempty"`
+	Type     string       `json:"type,omitempty"`
 	Function FunctionCall `json:"function"`
 }
 

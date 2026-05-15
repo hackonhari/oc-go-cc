@@ -117,7 +117,10 @@ func TestTransformResponsePreservesReasoningContentWithToolCalls(t *testing.T) {
 		t.Fatalf("Content[1].Name = %q, want %q", got, want)
 	}
 
-	if got, want := anthropicResp.StopReason, "tool_use"; got != want {
+	if anthropicResp.StopReason == nil {
+		t.Fatalf("StopReason is nil, want pointer to %q", "tool_use")
+	}
+	if got, want := *anthropicResp.StopReason, "tool_use"; got != want {
 		t.Fatalf("StopReason = %q, want %q", got, want)
 	}
 }

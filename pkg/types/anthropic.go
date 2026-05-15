@@ -184,14 +184,17 @@ type ToolResult struct {
 
 // MessageResponse represents a response from the Anthropic Messages API.
 type MessageResponse struct {
-	ID           string         `json:"id"`
-	Type         string         `json:"type"`
-	Role         string         `json:"role"`
-	Content      []ContentBlock `json:"content"`
-	Model        string         `json:"model"`
-	StopReason   string         `json:"stop_reason,omitempty"`
-	StopSequence string         `json:"stop_sequence,omitempty"`
-	Usage        Usage          `json:"usage"`
+	ID      string         `json:"id"`
+	Type    string         `json:"type"`
+	Role    string         `json:"role"`
+	Content []ContentBlock `json:"content"`
+	Model   string         `json:"model"`
+	// StopReason and StopSequence are pointers so we can emit explicit JSON null
+	// in the message_start event (Anthropic spec requires the fields to appear
+	// with null values until the message completes).
+	StopReason   *string `json:"stop_reason"`
+	StopSequence *string `json:"stop_sequence"`
+	Usage        Usage   `json:"usage"`
 }
 
 // Usage represents token usage information.
@@ -211,21 +214,32 @@ type ContentBlockDelta struct {
 
 // Delta represents a partial update in a streaming response.
 type Delta struct {
-	Type        string `json:"type"`
-	Text        string `json:"text,omitempty"`
-	Thinking    string `json:"thinking,omitempty"`
-	PartialJSON string `json:"partial_json,omitempty"`
-	StopReason  string `json:"stop_reason,omitempty"`
+	// Type is omitted for message_delta events (which only carry stop_reason +
+	// stop_sequence). For content_block_delta events, the caller must set Type
+	// to one of: text_delta, input_json_delta, thinking_delta, signature_delta.
+	Type         string  `json:"type,omitempty"`
+	Text         string  `json:"text,omitempty"`
+	Thinking     string  `json:"thinking,omitempty"`
+	Signature    string  `json:"signature,omitempty"`
+	PartialJSON  string  `json:"partial_json,omitempty"`
+	StopReason   string  `json:"stop_reason,omitempty"`
+	StopSequence *string `json:"stop_sequence,omitempty"`
 }
 
 // MessageEvent represents a Server-Sent Event from the streaming API.
+//
+// Per Anthropic streaming spec:
+//   - content_block_start uses ContentBlock field
+//   - content_block_delta uses Delta field
+//   - content_block_stop uses Index only
 type MessageEvent struct {
-	Type    string           `json:"type"`
-	Message *MessageResponse `json:"message,omitempty"`
-	Index   *int             `json:"index,omitempty"`
-	Delta   *Delta           `json:"delta,omitempty"`
-	Usage   *Usage           `json:"usage,omitempty"`
-	Error   *APIError        `json:"error,omitempty"`
+	Type         string           `json:"type"`
+	Message      *MessageResponse `json:"message,omitempty"`
+	Index        *int             `json:"index,omitempty"`
+	ContentBlock *ContentBlock    `json:"content_block,omitempty"`
+	Delta        *Delta           `json:"delta,omitempty"`
+	Usage        *Usage           `json:"usage,omitempty"`
+	Error        *APIError        `json:"error,omitempty"`
 }
 
 // APIError represents an error from the Anthropic API.

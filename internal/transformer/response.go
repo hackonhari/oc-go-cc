@@ -38,13 +38,12 @@ func (t *ResponseTransformer) TransformResponse(
 
 	// Build Anthropic response.
 	anthropicResp := &types.MessageResponse{
-		ID:           openaiResp.ID,
-		Type:         "message",
-		Role:         "assistant",
-		Content:      contentBlocks,
-		Model:        originalModel,
-		StopReason:   stopReason,
-		StopSequence: "",
+		ID:         openaiResp.ID,
+		Type:       "message",
+		Role:       "assistant",
+		Content:    contentBlocks,
+		Model:      originalModel,
+		StopReason: &stopReason,
 		Usage: types.Usage{
 			InputTokens:              openaiResp.Usage.PromptTokens,
 			OutputTokens:             openaiResp.Usage.CompletionTokens,

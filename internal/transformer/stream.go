@@ -71,6 +71,12 @@ func (h *StreamHandler) ProxyStream(
 	var lineBuf bytes.Buffer
 	contentStarted := false
 	reasoningStarted := false
+	toolUseStarted := false
+	// Track the current OpenAI tool_call.index — DeepSeek/OpenAI stream tool args
+	// as multiple chunks sharing the same index. -1 means "no tool_use open yet".
+	currentToolIndex := -1
+	// Some providers omit tool_call.index on later tools; fall back on tool-call id.
+	lastToolCallID := ""
 
 	// Read in larger chunks for efficiency, then parse lines
 	readBuf := make([]byte, 4096)
@@ -94,7 +100,7 @@ func (h *StreamHandler) ProxyStream(
 					lineBuf.Reset()
 
 					// Process complete line
-					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, originalModel); err != nil {
+					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &toolUseStarted, &currentToolIndex, &lastToolCallID, originalModel); err != nil {
 						return err
 					}
 				} else {
@@ -107,7 +113,7 @@ func (h *StreamHandler) ProxyStream(
 			// Process any remaining data in buffer
 			if lineBuf.Len() > 0 {
 				line := lineBuf.String()
-				if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, originalModel); err != nil {
+				if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &toolUseStarted, &currentToolIndex, &lastToolCallID, originalModel); err != nil {
 					return err
 				}
 			}
@@ -139,6 +145,9 @@ func (h *StreamHandler) processSSELine(
 	contentIndex *int,
 	contentStarted *bool,
 	reasoningStarted *bool,
+	toolUseStarted *bool,
+	currentToolIndex *int,
+	lastToolCallID *string,
 	originalModel string,
 ) error {
 	line = strings.TrimSpace(line)
@@ -178,42 +187,37 @@ func (h *StreamHandler) processSSELine(
 				content := data[start : start+end]
 				if content != "" {
 					if !*contentStarted {
-						// If reasoning was already started, close it first
+						// If reasoning was already started, close it (with signature_delta) first
 						if *reasoningStarted {
-							stopEvent := types.MessageEvent{
-								Type:  "content_block_stop",
-								Index: contentIndex,
-							}
-							if err := writeSSEEvent(w, stopEvent); err != nil {
+							if err := closeContentBlock(w, contentIndex, true); err != nil {
 								return ErrClientDisconnected
 							}
 							*contentIndex++
 							*reasoningStarted = false
 						}
-						*contentStarted = true
-						// Send content_block_start
-						startEvent := types.MessageEvent{
-							Type:  "content_block_start",
-							Index: contentIndex,
-							Delta: &types.Delta{
-								Type: "text",
-							},
-						}
-						if err := writeSSEEvent(w, startEvent); err != nil {
-							return ErrClientDisconnected
-						}
+					*contentStarted = true
+					// Send content_block_start with proper Anthropic spec format:
+					// uses content_block field, not delta
+					startEvent := types.MessageEvent{
+						Type:         "content_block_start",
+						Index:        contentIndex,
+						ContentBlock: &types.ContentBlock{Type: "text", Text: ""},
 					}
+					if err := writeSSEEvent(w, startEvent); err != nil {
+						return ErrClientDisconnected
+					}
+				}
 
-					// Send content_block_delta
-					delta := types.Delta{
-						Type: "text_delta",
-						Text: content,
-					}
-					event := types.MessageEvent{
-						Type:  "content_block_delta",
-						Index: contentIndex,
-						Delta: &delta,
-					}
+				// Send content_block_delta
+				delta := types.Delta{
+					Type: "text_delta",
+					Text: content,
+				}
+				event := types.MessageEvent{
+					Type:  "content_block_delta",
+					Index: contentIndex,
+					Delta: &delta,
+				}
 					if err := writeSSEEvent(w, event); err != nil {
 						return ErrClientDisconnected
 					}
@@ -224,24 +228,41 @@ func (h *StreamHandler) processSSELine(
 		}
 	}
 
-	// Check for finish_reason - need to send stop events
-	if strings.Contains(data, `"finish_reason":`) && !strings.Contains(data, `"finish_reason":null`) {
-		// Close any open content block (reasoning or text)
-		if *contentStarted || *reasoningStarted {
-			stopEvent := types.MessageEvent{
-				Type:  "content_block_stop",
-				Index: contentIndex,
-			}
-			if err := writeSSEEvent(w, stopEvent); err != nil {
+	// Check for finish_reason — close blocks and emit message_delta.
+	// IMPORTANT: do not take this string fast-path when this same SSE line also
+	// carries tool_calls or reasoning_content. Those must be processed via JSON
+	// unmarshaling below; otherwise the last chunk can drop final tool deltas
+	// (breaking the 2nd+ parallel tool) or lose reasoning tokens.
+	if strings.Contains(data, `"finish_reason":`) && !strings.Contains(data, `"finish_reason":null`) &&
+		!strings.Contains(data, `"tool_calls"`) && !strings.Contains(data, `"reasoning_content"`) {
+		// Close any open content block (reasoning, text, or tool_use).
+		// Thinking blocks must emit signature_delta before content_block_stop.
+		if *contentStarted || *reasoningStarted || *toolUseStarted {
+			if err := closeContentBlock(w, contentIndex, *reasoningStarted); err != nil {
 				return ErrClientDisconnected
 			}
+			*contentStarted = false
+			*reasoningStarted = false
+			*toolUseStarted = false
 		}
 
-		// Send message_delta with stop_reason
+		// Map OpenAI finish_reason to Anthropic stop_reason. The fast-path needs
+		// this for chunks that contain only finish_reason metadata (no full JSON
+		// parse). tool_calls → tool_use is the most important mapping; without
+		// it, Claude Code may not realize the assistant invoked a tool.
+		stopReason := "end_turn"
+		if strings.Contains(data, `"finish_reason":"tool_calls"`) {
+			stopReason = "tool_use"
+		} else if strings.Contains(data, `"finish_reason":"length"`) {
+			stopReason = "max_tokens"
+		} else if strings.Contains(data, `"finish_reason":"stop"`) {
+			stopReason = "end_turn"
+		}
+
 		msgDelta := types.MessageEvent{
 			Type: "message_delta",
 			Delta: &types.Delta{
-				StopReason: "end_turn", // Simplified - OpenAI usually sends "stop"
+				StopReason: stopReason,
 			},
 		}
 		if err := writeSSEEvent(w, msgDelta); err != nil {
@@ -267,25 +288,20 @@ func (h *StreamHandler) processSSELine(
 	// Handle reasoning content deltas
 	if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
 		if !*reasoningStarted {
-			// If text was already started, close it first
+			// If text was already started, close it first (no signature for text)
 			if *contentStarted {
-				stopEvent := types.MessageEvent{
-					Type:  "content_block_stop",
-					Index: contentIndex,
-				}
-				if err := writeSSEEvent(w, stopEvent); err != nil {
+				if err := closeContentBlock(w, contentIndex, false); err != nil {
 					return ErrClientDisconnected
 				}
 				*contentIndex++
 				*contentStarted = false
 			}
 			*reasoningStarted = true
+			// Per Anthropic spec, content_block_start uses content_block field
 			startEvent := types.MessageEvent{
-				Type:  "content_block_start",
-				Index: contentIndex,
-				Delta: &types.Delta{
-					Type: "thinking",
-				},
+				Type:         "content_block_start",
+				Index:        contentIndex,
+				ContentBlock: &types.ContentBlock{Type: "thinking", Thinking: ""},
 			}
 			if err := writeSSEEvent(w, startEvent); err != nil {
 				return ErrClientDisconnected
@@ -310,25 +326,20 @@ func (h *StreamHandler) processSSELine(
 	// Handle text content deltas
 	if choice.Delta.Content != "" {
 		if !*contentStarted {
-			// If reasoning was already started, close it first
+			// If reasoning was already started, close it (with signature_delta) first
 			if *reasoningStarted {
-				stopEvent := types.MessageEvent{
-					Type:  "content_block_stop",
-					Index: contentIndex,
-				}
-				if err := writeSSEEvent(w, stopEvent); err != nil {
+				if err := closeContentBlock(w, contentIndex, true); err != nil {
 					return ErrClientDisconnected
 				}
 				*contentIndex++
 				*reasoningStarted = false
 			}
 			*contentStarted = true
+			// Per Anthropic spec, content_block_start uses content_block field
 			startEvent := types.MessageEvent{
-				Type:  "content_block_start",
-				Index: contentIndex,
-				Delta: &types.Delta{
-					Type: "text",
-				},
+				Type:         "content_block_start",
+				Index:        contentIndex,
+				ContentBlock: &types.ContentBlock{Type: "text", Text: ""},
 			}
 			if err := writeSSEEvent(w, startEvent); err != nil {
 				return ErrClientDisconnected
@@ -350,22 +361,70 @@ func (h *StreamHandler) processSSELine(
 		flusher.Flush()
 	}
 
-	// Handle tool call deltas
+	// Handle tool call deltas.
+	// OpenAI/DeepSeek streams tool_call argument fragments across many chunks,
+	// each sharing the same tool_call.index. We must dedupe — only open a new
+	// content_block when tc.Index differs from currentToolIndex; otherwise emit
+	// input_json_delta to extend the open tool_use block.
 	if len(choice.Delta.ToolCalls) > 0 {
 		for _, tc := range choice.Delta.ToolCalls {
-			*contentIndex++
-
-			startEvent := types.MessageEvent{
-				Type:  "content_block_start",
-				Index: contentIndex,
-				Delta: &types.Delta{
-					Type: "tool_use",
-				},
-			}
-			if err := writeSSEEvent(w, startEvent); err != nil {
-				return ErrClientDisconnected
+			tcIdx := 0
+			hasIdx := false
+			if tc.Index != nil {
+				tcIdx = *tc.Index
+				hasIdx = true
 			}
 
+			// New tool_use when OpenAI index advances, or when index is missing
+			// but a new non-empty tool id appears (some providers omit index on 2nd tool).
+			isNewToolCall := false
+			if hasIdx {
+				isNewToolCall = *currentToolIndex != tcIdx
+			} else if tc.ID != "" && tc.ID != *lastToolCallID {
+				isNewToolCall = true
+			}
+
+			if isNewToolCall {
+				// Close any prior open block (text/thinking/tool_use) per Anthropic spec.
+				// Thinking blocks must emit signature_delta before content_block_stop.
+				if *contentStarted || *reasoningStarted || *toolUseStarted {
+					if err := closeContentBlock(w, contentIndex, *reasoningStarted); err != nil {
+						return ErrClientDisconnected
+					}
+					*contentStarted = false
+					*reasoningStarted = false
+					*toolUseStarted = false
+				}
+
+				*contentIndex++
+				*toolUseStarted = true
+				if hasIdx {
+					*currentToolIndex = tcIdx
+				} else {
+					*currentToolIndex++
+				}
+				if tc.ID != "" {
+					*lastToolCallID = tc.ID
+				}
+
+				// content_block_start carries id+name+input per Anthropic spec.
+				startEvent := types.MessageEvent{
+					Type:  "content_block_start",
+					Index: contentIndex,
+					ContentBlock: &types.ContentBlock{
+						Type:  "tool_use",
+						ID:    tc.ID,
+						Name:  tc.Function.Name,
+						Input: json.RawMessage(`{}`),
+					},
+				}
+				if err := writeSSEEvent(w, startEvent); err != nil {
+					return ErrClientDisconnected
+				}
+			}
+
+			// Stream the partial JSON for arguments — every chunk that has args
+			// (whether opening or continuing) emits an input_json_delta.
 			if tc.Function.Arguments != "" {
 				delta := types.Delta{
 					Type:        "input_json_delta",
@@ -386,15 +445,15 @@ func (h *StreamHandler) processSSELine(
 
 	// Handle finish reason
 	if choice.FinishReason != "" {
-		// Close any open content block (reasoning or text)
-		if *contentStarted || *reasoningStarted {
-			stopEvent := types.MessageEvent{
-				Type:  "content_block_stop",
-				Index: contentIndex,
-			}
-			if err := writeSSEEvent(w, stopEvent); err != nil {
+		// Close any open content block (reasoning, text, or tool_use).
+		// Thinking blocks must emit signature_delta before content_block_stop.
+		if *contentStarted || *reasoningStarted || *toolUseStarted {
+			if err := closeContentBlock(w, contentIndex, *reasoningStarted); err != nil {
 				return ErrClientDisconnected
 			}
+			*contentStarted = false
+			*reasoningStarted = false
+			*toolUseStarted = false
 		}
 
 		var usage *types.Usage
@@ -421,6 +480,32 @@ func (h *StreamHandler) processSSELine(
 	}
 
 	return nil
+}
+
+// closeContentBlock emits the correct closing sequence for a content block.
+// For thinking blocks, Anthropic spec requires a signature_delta event before
+// content_block_stop — without it, Claude Code's parser fails. Since DeepSeek
+// doesn't provide a real signature, we emit a placeholder; Claude Code only
+// needs the field present to advance its parser state.
+func closeContentBlock(w http.ResponseWriter, index *int, isThinking bool) error {
+	if isThinking {
+		sigDelta := types.MessageEvent{
+			Type:  "content_block_delta",
+			Index: index,
+			Delta: &types.Delta{
+				Type:      "signature_delta",
+				Signature: "proxy_synthesized",
+			},
+		}
+		if err := writeSSEEvent(w, sigDelta); err != nil {
+			return err
+		}
+	}
+	stopEvent := types.MessageEvent{
+		Type:  "content_block_stop",
+		Index: index,
+	}
+	return writeSSEEvent(w, stopEvent)
 }
 
 // writeSSEEvent writes a single SSE event to the HTTP response writer.

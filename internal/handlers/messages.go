@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"strings"
 	"time"
 
@@ -33,18 +34,23 @@ type MessagesHandler struct {
 	tokenCounter        *token.Counter
 	logger              *slog.Logger
 	rateLimiter         *middleware.RateLimiter
-	requestDedup        *middleware.RequestDeduplicator
 	requestIDGen        *middleware.RequestIDGenerator
 	metrics             *metrics.Metrics
 }
 
-// responseWriter wraps http.ResponseWriter to track if headers were written.
+// responseWriter wraps http.ResponseWriter to track if headers were written
+// and to serialize concurrent writes (http.ResponseWriter is not safe for
+// concurrent use, but handleStreaming runs a heartbeat goroutine alongside
+// the SSE writer — without the mutex, interleaved bytes corrupt the stream).
 type responseWriter struct {
 	http.ResponseWriter
 	wroteHeader bool
+	mu          sync.Mutex
 }
 
 func (w *responseWriter) WriteHeader(code int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.wroteHeader {
 		w.wroteHeader = true
 		w.ResponseWriter.WriteHeader(code)
@@ -52,14 +58,19 @@ func (w *responseWriter) WriteHeader(code int) {
 }
 
 func (w *responseWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !w.wroteHeader {
-		w.WriteHeader(http.StatusOK)
+		w.wroteHeader = true
+		w.ResponseWriter.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(b)
 }
 
 // Flush implements http.Flusher for SSE streaming support.
 func (w *responseWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -85,7 +96,6 @@ func NewMessagesHandler(
 		tokenCounter:        tokenCounter,
 		logger:              slog.Default(),
 		rateLimiter:         middleware.NewRateLimiter(100, time.Minute),
-		requestDedup:        middleware.NewRequestDeduplicator(500 * time.Millisecond),
 		requestIDGen:        middleware.NewRequestIDGenerator(),
 		metrics:             metrics,
 	}
@@ -118,13 +128,6 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	var rawBody json.RawMessage
 	if err := json.NewDecoder(r.Body).Decode(&rawBody); err != nil {
 		h.sendError(w, http.StatusBadRequest, "invalid request body", err)
-		return
-	}
-
-	// Deduplicate - skip duplicate requests
-	if _, ok := h.requestDedup.TryAcquire(rawBody); !ok {
-		h.metrics.RecordDeduplicated()
-		h.logger.Info("duplicate request skipped", "request_id", requestID)
 		return
 	}
 
@@ -180,13 +183,15 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Route to appropriate model.
-	// For streaming, use faster models to minimize TTFT (time-to-first-token)
+	// Pass the requested model name so the router can honor explicit selection
+	// (via /model command, ANTHROPIC_MODEL env var, or claude-* model names).
+	// For streaming, use faster models to minimize TTFT when no explicit model is set.
 	var routeResult router.RouteResult
 	if isStreaming {
-		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
+		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount, anthropicReq.Model)
 	} else {
 		var err error
-		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount)
+		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount, anthropicReq.Model)
 		if err != nil {
 			h.sendError(w, http.StatusInternalServerError, "routing failed", err)
 			return
@@ -194,8 +199,9 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.logger.Info("routing request",
+		"requested_model", anthropicReq.Model,
 		"scenario", routeResult.Scenario,
-		"model", routeResult.Primary.ModelID,
+		"resolved_model", routeResult.Primary.ModelID,
 		"tokens", tokenCount,
 	)
 
@@ -228,14 +234,12 @@ func (h *MessagesHandler) handleStreaming(
 
 	// Set SSE headers immediately so Claude Code knows the stream is alive.
 	// This prevents client-side timeouts before we even start sending data.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	rw.Header().Set("Cache-Control", "no-cache")
+	rw.Header().Set("Connection", "keep-alive")
+	rw.Header().Set("X-Accel-Buffering", "no")
+	rw.WriteHeader(http.StatusOK)
+	rw.Flush()
 
 	// Start heartbeat to keep connection alive while waiting for upstream.
 	// Claude Code times out after ~6 seconds of no data, so we send pings every 3 seconds
@@ -248,11 +252,12 @@ func (h *MessagesHandler) handleStreaming(
 		for {
 			select {
 			case <-ticker.C:
-				// Send SSE comment (ignored by client but keeps connection alive)
-				_, _ = fmt.Fprintf(w, ":keepalive\n\n")
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
+				// Send SSE comment (ignored by client but keeps connection alive).
+				// Must write through rw (not the raw w) so the mutex serializes
+				// against concurrent SSE event writes — otherwise bytes interleave
+				// and Claude Code sees InvalidHTTPResponse.
+				_, _ = fmt.Fprintf(rw, ":keepalive\n\n")
+				rw.Flush()
 			case <-heartbeatDone:
 				return
 			case <-clientCtx.Done():
@@ -276,9 +281,10 @@ func (h *MessagesHandler) handleStreaming(
 
 		h.logger.Info("attempting streaming model", "model", model.ModelID)
 
-		// Create a fresh context with timeout for THIS attempt only.
-		// Don't use r.Context() directly - it gets canceled when Claude Code retries.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		// Create a fresh context for THIS attempt only — no timeout.
+		// Streaming requests can run many minutes (DeepSeek V4 Pro reasoning).
+		// Transport-level timeouts handle connection hangs; clientCtx handles disconnects.
+		ctx, cancel := context.WithCancel(context.Background())
 
 		// Check if this is an Anthropic-native model (MiniMax)
 		if client.IsAnthropicModel(model.ModelID) {
