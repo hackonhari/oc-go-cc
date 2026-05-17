@@ -42,6 +42,7 @@ Configuration is stored at ~/.config/oc-go-cc/config.json`,
 	rootCmd.AddCommand(modelsCmd())
 	rootCmd.AddCommand(autostartCmd())
 	rootCmd.AddCommand(keysStatusCmd())
+	rootCmd.AddCommand(clearExhaustedCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)

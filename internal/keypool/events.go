@@ -6,13 +6,15 @@ import "time"
 // The actual JSONL logger lives in this package's log.go; this file
 // defines the wire format consumed by other packages.
 const (
-	EventKeyAcquired           = "key_acquired"
-	EventKeyExhaustedHard      = "key_exhausted_hard"
-	EventKeyThrottleTransient  = "key_throttle_transient"
-	EventKeyResetAutoclear     = "key_reset_autoclear"
-	EventFreeFallbackEngaged   = "free_fallback_engaged"
-	EventFreeFallbackModelFail = "free_fallback_model_failed"
-	EventAllExhausted502       = "all_exhausted_502"
+	EventKeyAcquired                = "key_acquired"
+	EventKeyExhaustedHard           = "key_exhausted_hard"
+	EventKeyThrottleTransient       = "key_throttle_transient"
+	EventKeyResetAutoclear          = "key_reset_autoclear"
+	EventKeyRevived                 = "key_revived"
+	EventKeyRevalidationStillFailed = "key_revalidation_still_exhausted"
+	EventFreeFallbackEngaged        = "free_fallback_engaged"
+	EventFreeFallbackModelFail      = "free_fallback_model_failed"
+	EventAllExhausted502            = "all_exhausted_502"
 )
 
 // Event is a structured rotation event written to the JSONL daily log.

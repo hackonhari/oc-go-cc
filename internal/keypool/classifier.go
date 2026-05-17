@@ -99,12 +99,16 @@ func (c *Classifier) OnUpstreamError(resp *http.Response, body []byte) RotationD
 			}
 		}
 
-		// Ambiguous: 429 with no header and no body code. Treat as Hard
-		// for safety (better to over-rotate than spin on a dead key).
+		// No signal at all: 429 with no Retry-After header and no quota
+		// body. OpenCode's burst-throttle responses are shaped exactly
+		// like this — treating them as Hard permanently kills healthy
+		// keys (2026-05-17 incident). Treat as Transient with 60s
+		// backoff; only explicit hard signals (CreditsError, quota
+		// keywords, long Retry-After) may rotate.
 		return RotationDecision{
-			Class:     DecisionAmbiguous,
-			ResetDate: now.Add(c.fallbackResetDuration),
-			Reason:    "429_ambiguous_default_hard",
+			Class:      DecisionTransient,
+			RetryAfter: 60 * time.Second,
+			Reason:     "429_no_signal_treat_as_transient",
 		}
 	}
 

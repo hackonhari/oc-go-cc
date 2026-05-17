@@ -61,6 +61,12 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// (e.g. adding a 3rd account) are picked up without proxy restart.
 	pool.StartHotReload(context.Background(), keypool.DefaultHotReloadInterval)
 
+	// Start revalidator — every 6h, probe each exhausted key with a tiny
+	// request. HTTP 200 → clear exhaustion (auto-heals classifier false
+	// positives). Runs perpetually until proxy shutdown.
+	revalidator := keypool.NewRevalidator(pool, cfg.OpenCodeGo.BaseURL, logger)
+	go revalidator.Run(context.Background())
+
 	// Rotation event log — daily JSONL at ~/.cache/oc-go-cc/rotation-YYYYMMDD.log.
 	// Wired into both pool (key acquired/exhausted/transient/reset events)
 	// AND freepool (fallback engagement events).

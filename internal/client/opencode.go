@@ -6,7 +6,6 @@
 // request is sent, and any 401/429 response is fed through the classifier:
 //   - DecisionTransient → backoff + retry the SAME key (up to maxTransientRetries)
 //   - DecisionHard      → MarkExhausted + Acquire next key + retry
-//   - DecisionAmbiguous → treated as Hard
 //
 // 5xx upstream errors are NOT the key's fault; they propagate to the
 // caller without touching pool state. ErrAllExhausted bubbles up when no
@@ -212,7 +211,7 @@ func (c *OpenCodeClient) doWithRotation(
 					}
 					continue // retry same key
 
-				case keypool.DecisionHard, keypool.DecisionAmbiguous:
+				case keypool.DecisionHard:
 					_ = c.pool.MarkExhausted(key.Token, dec.ResetDate, dec.Reason)
 					break // breaks inner loop, outer loop Acquire()s next key
 

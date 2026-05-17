@@ -124,6 +124,67 @@ func TestMarkExhausted_AllExhausted(t *testing.T) {
 	}
 }
 
+func TestClearExhausted_RestoresKey(t *testing.T) {
+	pool := New(stateFilePath(t), nil)
+	_ = pool.SeedKeys([]*Key{
+		mkKey("sk-a", "primary", nil, time.Now().Add(30*24*time.Hour)),
+		mkKey("sk-b", "secondary", nil, time.Now().Add(30*24*time.Hour)),
+	}, FreeFallback{})
+
+	// Exhaust primary, confirm secondary becomes active.
+	_ = pool.MarkExhausted("sk-a", time.Now().Add(30*24*time.Hour), "test")
+	snap := pool.Snapshot()
+	if snap[0].ExhaustedAt == nil {
+		t.Fatalf("setup: sk-a should be exhausted after MarkExhausted")
+	}
+
+	// Revive primary.
+	if err := pool.ClearExhausted("sk-a", "test_revive"); err != nil {
+		t.Fatalf("ClearExhausted: %v", err)
+	}
+
+	snap = pool.Snapshot()
+	if snap[0].ExhaustedAt != nil {
+		t.Errorf("sk-a ExhaustedAt should be nil after ClearExhausted, got %v", snap[0].ExhaustedAt)
+	}
+	if !snap[0].ResetDate.IsZero() {
+		t.Errorf("sk-a ResetDate should be zero after ClearExhausted, got %v", snap[0].ResetDate)
+	}
+
+	// Confirm primary is acquirable again (active keys are returned in pool order).
+	k, err := pool.Acquire()
+	if err != nil {
+		t.Fatalf("Acquire after clear: %v", err)
+	}
+	if k.Token != "sk-a" {
+		t.Errorf("Acquire returned %q, want sk-a (revived primary)", k.Token)
+	}
+}
+
+func TestClearExhausted_NoOpOnActiveKey(t *testing.T) {
+	pool := New(stateFilePath(t), nil)
+	_ = pool.SeedKeys([]*Key{
+		mkKey("sk-a", "primary", nil, time.Now().Add(30*24*time.Hour)),
+	}, FreeFallback{})
+
+	// sk-a is already active. ClearExhausted should be a no-op (no error).
+	if err := pool.ClearExhausted("sk-a", "test_noop"); err != nil {
+		t.Errorf("ClearExhausted on active key should be no-op, got err=%v", err)
+	}
+}
+
+func TestClearExhausted_KeyNotFound(t *testing.T) {
+	pool := New(stateFilePath(t), nil)
+	_ = pool.SeedKeys([]*Key{
+		mkKey("sk-a", "primary", nil, time.Now().Add(30*24*time.Hour)),
+	}, FreeFallback{})
+
+	err := pool.ClearExhausted("sk-nonexistent", "test")
+	if err != ErrKeyNotFound {
+		t.Errorf("want ErrKeyNotFound, got %v", err)
+	}
+}
+
 func TestMarkExhausted_KeyNotFound(t *testing.T) {
 	pool := New(stateFilePath(t), nil)
 	_ = pool.SeedKeys([]*Key{

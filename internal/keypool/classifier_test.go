@@ -94,11 +94,12 @@ func TestClassifier_TableDriven(t *testing.T) {
 			wantRetryAfter: 60 * time.Second,
 		},
 		{
-			name:       "429 with no header, no body → ambiguous → hard",
-			status:     429,
-			body:       "",
-			wantClass:  DecisionAmbiguous,
-			wantReason: "429_ambiguous_default_hard",
+			name:           "429 with no header, no body → transient 60s (no-signal default)",
+			status:         429,
+			body:           "",
+			wantClass:      DecisionTransient,
+			wantReason:     "429_no_signal_treat_as_transient",
+			wantRetryAfter: 60 * time.Second,
 		},
 		{
 			name:       "429 with Retry-After + quota body — body wins (hard)",
@@ -109,20 +110,22 @@ func TestClassifier_TableDriven(t *testing.T) {
 			wantReason: "429_quota",
 		},
 		{
-			name:       "429 with malformed Retry-After (non-numeric) → treated as no header",
-			status:     429,
-			headers:    map[string]string{"Retry-After": "nonsense"},
-			body:       "",
-			wantClass:  DecisionAmbiguous,
-			wantReason: "429_ambiguous_default_hard",
+			name:           "429 with malformed Retry-After (non-numeric) → no-signal transient",
+			status:         429,
+			headers:        map[string]string{"Retry-After": "nonsense"},
+			body:           "",
+			wantClass:      DecisionTransient,
+			wantReason:     "429_no_signal_treat_as_transient",
+			wantRetryAfter: 60 * time.Second,
 		},
 		{
-			name:       "429 with negative Retry-After → treated as no header",
-			status:     429,
-			headers:    map[string]string{"Retry-After": "-5"},
-			body:       "",
-			wantClass:  DecisionAmbiguous,
-			wantReason: "429_ambiguous_default_hard",
+			name:           "429 with negative Retry-After → no-signal transient",
+			status:         429,
+			headers:        map[string]string{"Retry-After": "-5"},
+			body:           "",
+			wantClass:      DecisionTransient,
+			wantReason:     "429_no_signal_treat_as_transient",
+			wantRetryAfter: 60 * time.Second,
 		},
 		{
 			name:       "401 with quota in body (hypothetical) — still hard",
@@ -156,9 +159,9 @@ func TestClassifier_TableDriven(t *testing.T) {
 					t.Errorf("retryAfter = %v, want %v", dec.RetryAfter, tc.wantRetryAfter)
 				}
 			}
-			if tc.wantClass == DecisionHard || tc.wantClass == DecisionAmbiguous {
+			if tc.wantClass == DecisionHard {
 				if dec.ResetDate.IsZero() {
-					t.Errorf("hard/ambiguous decision should set ResetDate")
+					t.Errorf("hard decision should set ResetDate")
 				}
 			}
 		})

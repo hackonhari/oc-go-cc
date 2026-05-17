@@ -27,11 +27,14 @@ const (
 
 // defaultFreeFallbackModels is the ordered list of Zen free-tier models
 // tried in fallback. Order matters — deepseek-v4-flash-free first because
-// it mirrors the paid Go default model family.
+// it mirrors the paid Go default model family. nemotron added 2026-05-17
+// (NVIDIA 120B reasoning) as a 4th option after a real-net 24h window
+// observed the original 3 simultaneously 429-locked.
 var defaultFreeFallbackModels = []string{
 	"deepseek-v4-flash-free",
 	"qwen3.6-plus-free",
 	"minimax-m2.5-free",
+	"nemotron-3-super-free",
 }
 
 // envVarPattern matches ${ENV_VAR} placeholders in config values.

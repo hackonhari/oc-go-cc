@@ -23,7 +23,7 @@ oc-go-cc now manages a **pool of paid OpenCode Go API keys** with automatic rota
   ],
   "free_fallback": {
     "base_url": "https://opencode.ai/zen/v1",
-    "models": ["deepseek-v4-flash-free", "qwen3.6-plus-free", "minimax-m2.5-free"]
+    "models": ["deepseek-v4-flash-free", "qwen3.6-plus-free", "minimax-m2.5-free", "nemotron-3-super-free"]
   },
   "default_model": "deepseek-v4-pro",
   "model_aliases": {...},
@@ -78,10 +78,11 @@ Free models on Zen are anonymous (no auth header required), $0 cost. Verified li
 | `deepseek-v4-flash-free` | `/chat/completions` | Recommended default — mirrors paid Flash family |
 | `qwen3.6-plus-free` | `/chat/completions` | Strong coding |
 | `minimax-m2.5-free` | `/messages` | Long context |
-| `big-pickle` | `/chat/completions` | Reasoning |
-| `nemotron-3-super-free` | `/chat/completions` | Nvidia reasoning |
-| `ring-2.6-1t-free` | `/chat/completions` | 1T params |
-| `trinity-large-preview-free` | `/chat/completions` | Preview |
+| `nemotron-3-super-free` | `/chat/completions` | NVIDIA 120B reasoning — validated live 2026-05-17 when other 3 were simultaneously 429 |
+| `big-pickle` | `/chat/completions` | Reasoning (often 429-locked) |
+| `trinity-large-preview-free` | `/chat/completions` | Preview (often 429-locked) |
+
+`ring-2.6-1t-free` graduated to paid 2026-05-17 (see OpenRouter `inclusionai/ring-2.6-1t`) — removed from candidates.
 
 ### Dual-endpoint paths
 

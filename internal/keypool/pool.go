@@ -229,6 +229,38 @@ func (p *KeyPool) MarkExhausted(token string, resetDate time.Time, reason string
 	return ErrKeyNotFound
 }
 
+// ClearExhausted reverts a key's exhaustion state — clears ExhaustedAt and
+// ResetDate, persists, and emits EventKeyRevived. Used by the background
+// revalidator when a probe succeeds, by the manual clear-exhausted CLI,
+// and by future operator workflows.
+//
+// Returns ErrKeyNotFound if no key in the pool has the given token.
+// No-op if the key is already active — returns nil without emit.
+func (p *KeyPool) ClearExhausted(token, reason string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	now := time.Now()
+	for _, k := range p.keys {
+		if k.Token != token {
+			continue
+		}
+		if k.IsActive() {
+			return nil
+		}
+		k.ExhaustedAt = nil
+		k.ResetDate = time.Time{}
+		p.emitter.Emit(Event{
+			Timestamp: now,
+			Type:      EventKeyRevived,
+			Account:   k.Account,
+			Reason:    reason,
+		})
+		return p.saveLocked()
+	}
+	return ErrKeyNotFound
+}
+
 // MarkTransient records a transient throttle event. The key is NOT marked
 // exhausted; only the rotation log gets an entry. Used when the 429
 // classifier returns DecisionTransient.

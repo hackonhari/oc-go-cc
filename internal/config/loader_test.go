@@ -290,6 +290,18 @@ func TestFreeFallback_DefaultsInjected(t *testing.T) {
 	if cfg.FreeFallback.Models[0] != "deepseek-v4-flash-free" {
 		t.Errorf("first free model = %q, want deepseek-v4-flash-free", cfg.FreeFallback.Models[0])
 	}
+	// nemotron-3-super-free must be present — confirms 2026-05-17 AC4
+	// (defense against simultaneous 429 across the original 3).
+	foundNemotron := false
+	for _, m := range cfg.FreeFallback.Models {
+		if m == "nemotron-3-super-free" {
+			foundNemotron = true
+			break
+		}
+	}
+	if !foundNemotron {
+		t.Errorf("nemotron-3-super-free missing from default Models: %v", cfg.FreeFallback.Models)
+	}
 }
 
 func TestFreeFallback_UserOverrideRespected(t *testing.T) {

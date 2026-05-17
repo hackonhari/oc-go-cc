@@ -5,7 +5,12 @@ import (
 	"time"
 )
 
-// DecisionClass enumerates the three classifier outcomes for an upstream 429.
+// DecisionClass enumerates the classifier outcomes for an upstream error.
+//
+// A 429 without an explicit hard signal (no quota keyword in body, no
+// long Retry-After) is classified Transient. The earlier "Ambiguous"
+// class hard-killed healthy keys on burst-throttle 429s shaped exactly
+// like the no-signal case — see 2026-05-17 false-exhaustion incident.
 type DecisionClass int
 
 const (
@@ -13,8 +18,6 @@ const (
 	DecisionTransient DecisionClass = iota
 	// DecisionHard means the key is genuinely exhausted; rotate to the next key.
 	DecisionHard
-	// DecisionAmbiguous is treated as Hard for safety, but is logged distinctly.
-	DecisionAmbiguous
 )
 
 // String renders the class for log output.
@@ -24,8 +27,6 @@ func (d DecisionClass) String() string {
 		return "transient"
 	case DecisionHard:
 		return "hard"
-	case DecisionAmbiguous:
-		return "ambiguous"
 	default:
 		return "unknown"
 	}
