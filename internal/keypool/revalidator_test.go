@@ -28,7 +28,7 @@ func revalidatorTestPool(t *testing.T) *KeyPool {
 // avoids the goroutine/ticker complexity in unit tests.
 func runRevalidatorOnce(t *testing.T, pool *KeyPool, stub *httptest.Server) {
 	t.Helper()
-	r := NewRevalidatorWithInterval(pool, stub.URL, 1*time.Hour, nil)
+	r := NewRevalidatorWithInterval(pool, stub.URL, 1*time.Hour, nil, nil)
 	r.probeOnce(context.Background())
 }
 
@@ -115,7 +115,7 @@ func TestRevalidator_RunStopsOnContextCancel(t *testing.T) {
 	}))
 	defer stub.Close()
 
-	r := NewRevalidatorWithInterval(pool, stub.URL, 50*time.Millisecond, nil)
+	r := NewRevalidatorWithInterval(pool, stub.URL, 50*time.Millisecond, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -136,6 +136,62 @@ func TestRevalidator_RunStopsOnContextCancel(t *testing.T) {
 	}
 }
 
+// (captureEmitter lives in pool_test.go — shared across keypool tests.)
+
+// TestRevalidator_EmitsStartAndTick guards AC-C: operators must be able to
+// confirm revalidator health from the rotation log alone. Two events
+// must appear: revalidator_started (on Run entry) and revalidator_tick
+// (on every probe sweep including the immediate tick).
+func TestRevalidator_EmitsStartAndTick(t *testing.T) {
+	pool := revalidatorTestPool(t)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized) // keep exhausted so tick has work
+	}))
+	defer stub.Close()
+
+	emitter := &captureEmitter{}
+	r := NewRevalidatorWithInterval(pool, stub.URL, 1*time.Hour, nil, emitter)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go r.Run(ctx)
+
+	// Wait briefly for Run to enter and complete its immediate tick.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	time.Sleep(100 * time.Millisecond)
+
+	if !emitter.Has(EventRevalidatorStarted) {
+		t.Errorf("expected %q event, none seen. Events: %+v",
+			EventRevalidatorStarted, emitter.events)
+	}
+	if !emitter.Has(EventRevalidatorTick) {
+		t.Errorf("expected %q event, none seen. Events: %+v",
+			EventRevalidatorTick, emitter.events)
+	}
+}
+
+// TestRevalidator_HTTP200_EmitsKeyRevived guards AC-C: a successful probe
+// must surface in the rotation log via key_revived event. The event is
+// emitted by pool.ClearExhausted (not the revalidator itself), so we wire
+// the emitter into the pool, not the revalidator, for this assertion.
+func TestRevalidator_HTTP200_EmitsKeyRevived(t *testing.T) {
+	pool := revalidatorTestPool(t)
+	emitter := &captureEmitter{}
+	pool.SetEmitter(emitter)
+
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer stub.Close()
+
+	r := NewRevalidatorWithInterval(pool, stub.URL, 1*time.Hour, nil, nil)
+	r.probeOnce(context.Background())
+
+	if !emitter.Has(EventKeyRevived) {
+		t.Errorf("expected %q event after HTTP 200 probe, none seen", EventKeyRevived)
+	}
+}
+
 func TestRevalidator_RunRunsImmediateTick(t *testing.T) {
 	pool := revalidatorTestPool(t)
 
@@ -150,7 +206,7 @@ func TestRevalidator_RunRunsImmediateTick(t *testing.T) {
 	defer stub.Close()
 
 	// Use a long interval — only the immediate tick should fire.
-	r := NewRevalidatorWithInterval(pool, stub.URL, 1*time.Hour, nil)
+	r := NewRevalidatorWithInterval(pool, stub.URL, 1*time.Hour, nil, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -24,6 +24,28 @@ import (
 // stateFilePath is where the keypool persists runtime key state.
 const stateFilePath = "~/.config/oc-go-cc/key-states.json"
 
+// resolveFreeFallback picks the effective free_fallback config: state
+// file wins when it has any models, otherwise fall back to config.json
+// defaults. This lets operators add/remove free models via the same
+// hot-reloadable key-states.json that holds the paid key pool.
+//
+// Before 2026-05-18 cycle 2 fix, state file's free_fallback was
+// decorative-only — the freepool always read config.json values,
+// causing silent drift between Go defaults and runtime.
+//
+// Returns base URL, models, and a short source label for logging
+// ("state-file" | "config-default").
+func resolveFreeFallback(cfgFB config.FreeFallback, stateFB keypool.FreeFallback) (string, []string, string) {
+	if len(stateFB.Models) > 0 {
+		baseURL := stateFB.BaseURL
+		if baseURL == "" {
+			baseURL = cfgFB.BaseURL // state file specified models but no URL — borrow config URL
+		}
+		return baseURL, stateFB.Models, "state-file"
+	}
+	return cfgFB.BaseURL, cfgFB.Models, "config-default"
+}
+
 // rotationLogDir is where rotation events land as daily JSONL files.
 const rotationLogDir = "~/.cache/oc-go-cc"
 
@@ -61,24 +83,26 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	// (e.g. adding a 3rd account) are picked up without proxy restart.
 	pool.StartHotReload(context.Background(), keypool.DefaultHotReloadInterval)
 
-	// Start revalidator — every 6h, probe each exhausted key with a tiny
-	// request. HTTP 200 → clear exhaustion (auto-heals classifier false
-	// positives). Runs perpetually until proxy shutdown.
-	revalidator := keypool.NewRevalidator(pool, cfg.OpenCodeGo.BaseURL, logger)
-	go revalidator.Run(context.Background())
-
 	// Rotation event log — daily JSONL at ~/.cache/oc-go-cc/rotation-YYYYMMDD.log.
-	// Wired into both pool (key acquired/exhausted/transient/reset events)
-	// AND freepool (fallback engagement events).
+	// Wired into pool (key acquired/exhausted/transient/reset/revived events),
+	// revalidator (started/tick events), AND freepool (fallback engagement).
+	// Constructed BEFORE revalidator so we can pass it in. Pool gets it next.
 	eventLogger := keypool.NewEventLogger(expandHomePath(rotationLogDir), logger)
 	pool.SetEmitter(eventLogger)
 
+	// Start revalidator — every 6h, probe each exhausted key with a tiny
+	// request. HTTP 200 → clear exhaustion (auto-heals classifier false
+	// positives). Emits revalidator_started/tick events to rotation log so
+	// operators can verify health from the same channel as paid-pool events.
+	revalidator := keypool.NewRevalidator(pool, cfg.OpenCodeGo.BaseURL, logger, eventLogger)
+	go revalidator.Run(context.Background())
+
 	classifier := keypool.NewClassifier()
-	freeResolver := freepool.New(
-		cfg.FreeFallback.BaseURL,
-		cfg.FreeFallback.Models,
-		eventLogger,
-	)
+
+	freeBaseURL, freeModels, source := resolveFreeFallback(cfg.FreeFallback, pool.FreeFallback())
+	logger.Info("free_fallback resolved",
+		"source", source, "base_url", freeBaseURL, "models_count", len(freeModels))
+	freeResolver := freepool.New(freeBaseURL, freeModels, eventLogger)
 	openCodeClient := client.NewOpenCodeClient(cfg.OpenCodeGo, pool, classifier, freeResolver)
 	modelRouter := router.NewModelRouter(cfg)
 	fallbackHandler := router.NewFallbackHandler(logger, 3, 30*time.Second)

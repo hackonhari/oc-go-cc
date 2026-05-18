@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -27,6 +28,7 @@ type Revalidator struct {
 	interval   time.Duration
 	httpClient *http.Client
 	logger     *slog.Logger
+	emitter    EventEmitter // emits revalidator_started, revalidator_tick, key_revived
 }
 
 const (
@@ -37,17 +39,21 @@ const (
 
 // NewRevalidator returns a Revalidator with the production default interval
 // (6h). The probe URL is the OpenCode Go chat/completions endpoint configured
-// in the proxy. logger may be nil; defaults to slog.Default().
-func NewRevalidator(pool *KeyPool, probeURL string, logger *slog.Logger) *Revalidator {
-	return NewRevalidatorWithInterval(pool, probeURL, defaultRevalidationInterval, logger)
+// in the proxy. logger may be nil; defaults to slog.Default(). emitter
+// may be nil; events are then silently dropped (slog-only output).
+func NewRevalidator(pool *KeyPool, probeURL string, logger *slog.Logger, emitter EventEmitter) *Revalidator {
+	return NewRevalidatorWithInterval(pool, probeURL, defaultRevalidationInterval, logger, emitter)
 }
 
 // NewRevalidatorWithInterval is the test-only seam allowing a shorter tick
 // for integration tests that need to observe revival within seconds rather
 // than hours.
-func NewRevalidatorWithInterval(pool *KeyPool, probeURL string, interval time.Duration, logger *slog.Logger) *Revalidator {
+func NewRevalidatorWithInterval(pool *KeyPool, probeURL string, interval time.Duration, logger *slog.Logger, emitter EventEmitter) *Revalidator {
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if emitter == nil {
+		emitter = noopEmitter{}
 	}
 	return &Revalidator{
 		pool:       pool,
@@ -56,6 +62,7 @@ func NewRevalidatorWithInterval(pool *KeyPool, probeURL string, interval time.Du
 		interval:   interval,
 		httpClient: &http.Client{Timeout: probeTimeoutSeconds * time.Second},
 		logger:     logger,
+		emitter:    emitter,
 	}
 }
 
@@ -71,6 +78,11 @@ func NewRevalidatorWithInterval(pool *KeyPool, probeURL string, interval time.Du
 //   - Returns cleanly when ctx is Done
 func (r *Revalidator) Run(ctx context.Context) {
 	r.logger.Info("revalidator starting", "interval", r.interval, "probe_url", r.probeURL)
+	r.emitter.Emit(Event{
+		Timestamp: time.Now(),
+		Type:      EventRevalidatorStarted,
+		Reason:    "interval=" + r.interval.String(),
+	})
 
 	r.probeOnce(ctx)
 
@@ -92,6 +104,18 @@ func (r *Revalidator) Run(ctx context.Context) {
 // Probes happen sequentially so we never burst-load the upstream during a
 // tick. A failing probe is logged but does not stop the iteration.
 func (r *Revalidator) probeOnce(ctx context.Context) {
+	exhaustedCount := 0
+	for _, k := range r.pool.Snapshot() {
+		if !k.IsActive() {
+			exhaustedCount++
+		}
+	}
+	r.emitter.Emit(Event{
+		Timestamp: time.Now(),
+		Type:      EventRevalidatorTick,
+		Reason:    "probing " + strconv.Itoa(exhaustedCount) + " exhausted keys",
+	})
+
 	for _, k := range r.pool.Snapshot() {
 		if k.IsActive() {
 			continue
@@ -140,6 +164,9 @@ func (r *Revalidator) probeKey(ctx context.Context, k Key) {
 			r.logger.Error("revalidator clear-exhausted failed", "account", k.Account, "err", err)
 			return
 		}
+		// pool.ClearExhausted already emits EventKeyRevived through the
+		// pool's emitter — no duplicate emit here. The slog.Info is for
+		// human ops watching the JSON-formatted stdout log.
 		r.logger.Info("revalidator revived key", "account", k.Account)
 		return
 	}

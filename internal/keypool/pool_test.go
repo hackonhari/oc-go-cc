@@ -482,3 +482,16 @@ func (c *captureEmitter) Emit(e Event) {
 	defer c.mu.Unlock()
 	c.events = append(c.events, e)
 }
+
+// Has reports whether any event of the given type has been recorded.
+// Useful for revalidator tests asserting started/tick events fire.
+func (c *captureEmitter) Has(eventType string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, e := range c.events {
+		if e.Type == eventType {
+			return true
+		}
+	}
+	return false
+}

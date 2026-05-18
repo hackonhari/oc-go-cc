@@ -12,6 +12,8 @@ const (
 	EventKeyResetAutoclear          = "key_reset_autoclear"
 	EventKeyRevived                 = "key_revived"
 	EventKeyRevalidationStillFailed = "key_revalidation_still_exhausted"
+	EventRevalidatorStarted         = "revalidator_started"
+	EventRevalidatorTick            = "revalidator_tick"
 	EventFreeFallbackEngaged        = "free_fallback_engaged"
 	EventFreeFallbackModelFail      = "free_fallback_model_failed"
 	EventAllExhausted502            = "all_exhausted_502"

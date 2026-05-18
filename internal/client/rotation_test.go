@@ -189,6 +189,50 @@ func TestChatCompletion_429Transient_RetriesSameKeyWithBackoff(t *testing.T) {
 	}
 }
 
+// TestChatCompletion_TransientRetriesExhausted_UsesShortTTL guards against
+// regression of cycle 1's escalation-with-zero-ResetDate bug. After
+// maxTransientRetries+1 ambiguous 429s on the same key, the proxy escalates
+// to MarkExhausted. The TTL must be the short transientEscalationTTL
+// constant (15 min as of 2026-05-18), NOT zero (which permanently kills the
+// key) and NOT 30 days (which is the cap for real CreditsError exhaustion).
+func TestChatCompletion_TransientRetriesExhausted_UsesShortTTL(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test exercises real Transient retry backoff; ~240s")
+	}
+	// Always return ambiguous 429 — no Retry-After header, no quota keyword.
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(429)
+		_, _ = w.Write([]byte(`{"error":"please slow"}`))
+	}))
+	defer stub.Close()
+
+	// Two-key pool. The escalation should rotate from sk-bursty to sk-spare.
+	pool := newTestPool(t, "sk-bursty", "sk-spare")
+	c := NewOpenCodeClient(
+		config.OpenCodeGoConfig{BaseURL: stub.URL, AnthropicBaseURL: stub.URL},
+		pool, keypool.NewClassifier(), nil,
+	)
+
+	before := time.Now()
+	_, _ = c.ChatCompletion(context.Background(), "deepseek-v4-flash", trivialReq())
+	after := time.Now()
+
+	snap := pool.Snapshot()
+	// sk-bursty should be exhausted with SHORT TTL.
+	if snap[0].ExhaustedAt == nil {
+		t.Fatal("sk-bursty should be exhausted after transient retries exhausted")
+	}
+	if snap[0].ResetDate.IsZero() {
+		t.Errorf("sk-bursty ResetDate must NOT be zero (the cycle 1 bug); got %v", snap[0].ResetDate)
+	}
+	// Allow generous bounds — 15 min ± 5 min margin for clock skew + test slowness.
+	minExpected := before.Add(10 * time.Minute)
+	maxExpected := after.Add(20 * time.Minute)
+	if snap[0].ResetDate.Before(minExpected) || snap[0].ResetDate.After(maxExpected) {
+		t.Errorf("ResetDate = %v, want between %v and %v (15-min TTL)", snap[0].ResetDate, minExpected, maxExpected)
+	}
+}
+
 func TestChatCompletion_5xx_NotMarkedExhausted(t *testing.T) {
 	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(503)

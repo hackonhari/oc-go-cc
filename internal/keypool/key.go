@@ -23,14 +23,17 @@ func (k *Key) IsActive() bool {
 }
 
 // IsResetDue reports whether the key's reset date has passed.
-// Day-resolution semantics: a resetDate of 2026-06-04 becomes due at any
-// time on 2026-06-04 (inclusive).
+//
+// Direct timestamp comparison so sub-day TTLs (used by the transient
+// retry escalation, 15-min default) auto-clear on the request hot path.
+// Multi-day TTLs (monthly cap, 30d default) still work the same — a
+// resetDate of 2026-06-04 23:59 becomes due exactly then, not at midnight.
+//
+// Zero ResetDate → never due (no-op). The revalidator goroutine is the
+// fallback safety net for keys mistakenly marked with zero ResetDate.
 func (k *Key) IsResetDue(now time.Time) bool {
 	if k.ResetDate.IsZero() {
 		return false
 	}
-	// Compare date components only; ignore time-of-day.
-	resetDay := k.ResetDate.Truncate(24 * time.Hour)
-	today := now.Truncate(24 * time.Hour)
-	return !resetDay.After(today)
+	return !k.ResetDate.After(now)
 }

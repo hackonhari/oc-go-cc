@@ -38,6 +38,17 @@ import (
 // classifier's transient becomes effectively hard (we rotate).
 const maxTransientRetries = 2
 
+// transientEscalationTTL is the reset window applied when a key is
+// escalated from transient retries to hard exhaustion. Short TTL is
+// intentional: transient_retries_exhausted is NOT a real upstream
+// "you're permanently dry" signal — it's a "this key produced N
+// ambiguous 429s in a row, rotate elsewhere for now and let it cool off."
+//
+// Before 2026-05-18 this path used dec.ResetDate which is zero for
+// Transient decisions, killing healthy keys permanently. See cycle 2
+// of the false-exhaustion bugfix session.
+const transientEscalationTTL = 15 * time.Minute
+
 // ErrAllKeysExhausted is the typed signal the handler layer watches for
 // to engage free-fallback. It wraps keypool.ErrAllExhausted with extra
 // context (e.g. the earliest reset date) for the 502 response body.
@@ -196,8 +207,15 @@ func (c *OpenCodeClient) doWithRotation(
 				case keypool.DecisionTransient:
 					transientAttempts++
 					if transientAttempts > maxTransientRetries {
-						// Escalate to hard rotation.
-						_ = c.pool.MarkExhausted(key.Token, dec.ResetDate, "transient_retries_exhausted")
+						// Escalate to hard rotation, but with SHORT TTL — this
+						// is not a real upstream exhaustion signal. dec.ResetDate
+						// is zero for Transient decisions; using it would mark
+						// the key permanently dead. See cycle 2 fix.
+						_ = c.pool.MarkExhausted(
+							key.Token,
+							time.Now().Add(transientEscalationTTL),
+							"transient_retries_exhausted",
+						)
 						break // breaks inner loop, outer loop Acquire()s next key
 					}
 					c.pool.MarkTransient(key.Token, dec.RetryAfter, dec.Reason)
