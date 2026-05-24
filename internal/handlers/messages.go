@@ -8,8 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"sync"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"oc-go-cc/internal/client"
@@ -73,6 +74,57 @@ func (w *responseWriter) Flush() {
 	defer w.mu.Unlock()
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
 		f.Flush()
+	}
+}
+
+// streamHeartbeat sends SSE keepalive comments every 3 seconds until done
+// is closed OR ctx is cancelled. Used by handleStreaming to prevent
+// Claude Code's 6-second client-side timeout while we wait for upstream
+// data to arrive.
+//
+// LIFECYCLE CONTRACT — required of all callers:
+//
+//   - The caller MUST wait for this method to return before tearing down rw.
+//     Otherwise a tick can fire after the HTTP server has invalidated the
+//     response writer, and rw.Flush() panics on a nil bufio.Writer.
+//
+//   - Recommended pattern (used by handleStreaming):
+//     done := make(chan struct{})
+//     var wg sync.WaitGroup
+//     wg.Add(1)
+//     go func() { defer wg.Done(); h.streamHeartbeat(ctx, rw, done) }()
+//     defer func() { close(done); wg.Wait() }()
+//
+// The defer recover() is defense-in-depth: any future code change that
+// introduces a new race against rw will be caught here rather than
+// killing the entire proxy process. Without recover(), one panicking
+// request goroutine takes down every in-flight request AND the listener.
+func (h *MessagesHandler) streamHeartbeat(ctx context.Context, rw *responseWriter, done <-chan struct{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			h.logger.Error("heartbeat goroutine panic recovered",
+				"panic", r,
+				"stack", string(debug.Stack()))
+		}
+	}()
+
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Send SSE comment (ignored by client but keeps connection alive).
+			// Must write through rw (not the raw w) so the mutex serializes
+			// against concurrent SSE event writes — otherwise bytes interleave
+			// and Claude Code sees InvalidHTTPResponse.
+			_, _ = fmt.Fprintf(rw, ":keepalive\n\n")
+			rw.Flush()
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -244,29 +296,29 @@ func (h *MessagesHandler) handleStreaming(
 	// Start heartbeat to keep connection alive while waiting for upstream.
 	// Claude Code times out after ~6 seconds of no data, so we send pings every 3 seconds
 	// (frequent enough to prevent timeout, not so frequent as to cause overhead).
+	//
+	// Lifecycle (fixed 2026-05-20): the goroutine MUST exit before this
+	// handler returns. Otherwise a tick can fire AFTER the HTTP server
+	// has torn down the underlying response writer, and rw.Flush() panics
+	// on a nil bufio.Writer. The WaitGroup makes the deferred cleanup
+	// block until the goroutine has actually exited — not merely been
+	// signaled to exit. See streamHeartbeat docstring for the lifecycle
+	// contract.
 	heartbeatDone := make(chan struct{})
+	var heartbeatWG sync.WaitGroup
+	heartbeatWG.Add(1)
 	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				// Send SSE comment (ignored by client but keeps connection alive).
-				// Must write through rw (not the raw w) so the mutex serializes
-				// against concurrent SSE event writes — otherwise bytes interleave
-				// and Claude Code sees InvalidHTTPResponse.
-				_, _ = fmt.Fprintf(rw, ":keepalive\n\n")
-				rw.Flush()
-			case <-heartbeatDone:
-				return
-			case <-clientCtx.Done():
-				return
-			}
-		}
+		defer heartbeatWG.Done()
+		h.streamHeartbeat(clientCtx, rw, heartbeatDone)
 	}()
-	// Stop heartbeat when streaming completes
-	defer close(heartbeatDone)
+	// Stop heartbeat AND wait for it to fully exit before handler returns.
+	// Order matters: close signals the goroutine, Wait blocks until it has
+	// actually exited the select loop. Without Wait, the goroutine could
+	// still be mid-flush when the response writer is torn down.
+	defer func() {
+		close(heartbeatDone)
+		heartbeatWG.Wait()
+	}()
 
 	streamStart := time.Now()
 
