@@ -79,13 +79,18 @@ func (t *RequestTransformer) TransformRequest(
 		openaiReq.MaxTokens = &maxTokens
 	}
 
-	// Always honor the model config's thinking setting.
-	// When the config has thinking enabled, we send it on every request.
-	// transformAssistantMessage handles the round-trip placeholder issue
-	// for DeepSeek by injecting a non-empty reasoning_content when missing.
+	// Prefer the user's reasoning_effort from the request (Claude Code /effort),
+	// then the model config, then default to "high".
+	// Provider-specific disable_reasoning_effort is applied post-transform.
 	if thinkingEnabled {
-		if model.ReasoningEffort != "" {
-			openaiReq.ReasoningEffort = &model.ReasoningEffort
+		effort := ""
+		if anthropicReq.ReasoningEffort != nil && *anthropicReq.ReasoningEffort != "" {
+			effort = *anthropicReq.ReasoningEffort
+		} else if model.ReasoningEffort != "" {
+			effort = model.ReasoningEffort
+		}
+		if effort != "" {
+			openaiReq.ReasoningEffort = &effort
 		} else {
 			defaultEffort := "high"
 			openaiReq.ReasoningEffort = &defaultEffort

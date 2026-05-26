@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"oc-go-cc/internal/client"
 )
 
 // RequestDeduplicator prevents duplicate requests from flooding the upstream.
@@ -174,4 +176,46 @@ func (g *RequestIDGenerator) Generate() string {
 	defer g.mu.Unlock()
 	g.counter++
 	return fmt.Sprintf("req-%d-%d", time.Now().Unix(), g.counter)
+}
+
+// ctxKeyProvider is the request context key for the provider name
+// extracted from the URL path (e.g. /opencode/v1/messages → "opencode").
+type ctxKeyProvider struct{}
+
+// ProviderFromContext returns the provider name from the request context,
+// or "" when the request used the bare /v1/messages path (no provider in URL).
+func ProviderFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(ctxKeyProvider{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// ProviderPathMiddleware extracts a provider name from URL paths like
+// /<provider>/v1/messages, injects it into the request context, and rewrites
+// the URL so downstream handlers see /v1/messages. Requests without a provider
+// prefix (bare /v1/messages) pass through unchanged.
+func ProviderPathMiddleware(uc *client.UniversalClient) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+			if !strings.HasPrefix(path, "/") {
+				next.ServeHTTP(w, r)
+				return
+			}
+			parts := strings.SplitN(path[1:], "/", 3)
+			if len(parts) < 3 || parts[1] != "v1" {
+				next.ServeHTTP(w, r)
+				return
+			}
+			providerName := parts[0]
+			if uc == nil || !uc.HasProvider(providerName) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), ctxKeyProvider{}, providerName))
+			r.URL.Path = "/" + parts[1] + "/" + parts[2]
+			next.ServeHTTP(w, r)
+		})
+	}
 }

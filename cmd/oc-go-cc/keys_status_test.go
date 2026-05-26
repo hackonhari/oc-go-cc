@@ -37,11 +37,11 @@ func mkSampleState() *keyStateFile {
 
 func TestRedactToken(t *testing.T) {
 	cases := map[string]string{
-		"sk-ABCDEFghijklmnop":              "sk-ABC***mnop",
+		"sk-ABCDEFghijklmnop":                     "sk-ABC***mnop",
 		"sk-JNPBrTIagfUenKFDyrs6Iskxb0SlefWBe59K": "sk-JNP***e59K",
-		"short":                            "***",
-		"":                                 "***",
-		"exactly14chars":                   "***",
+		"short":          "***",
+		"":               "***",
+		"exactly14chars": "***",
 	}
 	for in, want := range cases {
 		if got := redactToken(in); got != want {

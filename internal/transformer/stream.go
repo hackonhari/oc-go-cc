@@ -166,6 +166,7 @@ func (h *StreamHandler) processSSELine(
 	if data == "" {
 		return nil
 	}
+	// Process the SSE data line
 
 	// Handle [DONE] marker
 	if data == "[DONE]" {
@@ -178,14 +179,28 @@ func (h *StreamHandler) processSSELine(
 	// correctly. Otherwise reasoning_content gets silently dropped, and on the
 	// next turn DeepSeek rejects the request with:
 	//   "The reasoning_content in the thinking mode must be passed back to the API."
-	if !strings.Contains(data, `"reasoning_content"`) {
+	if !strings.Contains(data, `"reasoning_content"`) && !strings.Contains(data, `"reasoning":`) {
 		if idx := strings.Index(data, `"delta":{"content":"`); idx != -1 {
 			// Extract content directly
 			start := idx + len(`"delta":{"content":"`)
-			end := strings.Index(data[start:], `"`)
+			// Scan for closing quote, skipping JSON-escaped chars.
+			// A naive Index search breaks on \" inside the content
+			// (e.g. "hello" → extracted as just "\").
+			end := -1
+			for i := 0; i < len(data[start:]); i++ {
+				if data[start+i] == '\\' {
+					i++ // skip JSON-escaped character
+				} else if data[start+i] == '"' {
+					end = i
+					break
+				}
+			}
 			if end != -1 {
 				content := data[start : start+end]
 				if content != "" {
+					// Unescape JSON escape sequences that the fast path's raw string
+					// extraction picks up literally (e.g. \n becomes actual newline).
+					content = unescapeJSON(content)
 					if !*contentStarted {
 						// If reasoning was already started, close it (with signature_delta) first
 						if *reasoningStarted {
@@ -195,29 +210,29 @@ func (h *StreamHandler) processSSELine(
 							*contentIndex++
 							*reasoningStarted = false
 						}
-					*contentStarted = true
-					// Send content_block_start with proper Anthropic spec format:
-					// uses content_block field, not delta
-					startEvent := types.MessageEvent{
-						Type:         "content_block_start",
-						Index:        contentIndex,
-						ContentBlock: &types.ContentBlock{Type: "text", Text: ""},
+						*contentStarted = true
+						// Send content_block_start with proper Anthropic spec format:
+						// uses content_block field, not delta
+						startEvent := types.MessageEvent{
+							Type:         "content_block_start",
+							Index:        contentIndex,
+							ContentBlock: &types.ContentBlock{Type: "text", Text: ""},
+						}
+						if err := writeSSEEvent(w, startEvent); err != nil {
+							return ErrClientDisconnected
+						}
 					}
-					if err := writeSSEEvent(w, startEvent); err != nil {
-						return ErrClientDisconnected
-					}
-				}
 
-				// Send content_block_delta
-				delta := types.Delta{
-					Type: "text_delta",
-					Text: content,
-				}
-				event := types.MessageEvent{
-					Type:  "content_block_delta",
-					Index: contentIndex,
-					Delta: &delta,
-				}
+					// Send content_block_delta
+					delta := types.Delta{
+						Type: "text_delta",
+						Text: content,
+					}
+					event := types.MessageEvent{
+						Type:  "content_block_delta",
+						Index: contentIndex,
+						Delta: &delta,
+					}
 					if err := writeSSEEvent(w, event); err != nil {
 						return ErrClientDisconnected
 					}
@@ -234,7 +249,7 @@ func (h *StreamHandler) processSSELine(
 	// unmarshaling below; otherwise the last chunk can drop final tool deltas
 	// (breaking the 2nd+ parallel tool) or lose reasoning tokens.
 	if strings.Contains(data, `"finish_reason":`) && !strings.Contains(data, `"finish_reason":null`) &&
-		!strings.Contains(data, `"tool_calls"`) && !strings.Contains(data, `"reasoning_content"`) {
+		!strings.Contains(data, `"tool_calls"`) && !strings.Contains(data, `"reasoning_content"`) && !strings.Contains(data, `"reasoning":`) {
 		// Close any open content block (reasoning, text, or tool_use).
 		// Thinking blocks must emit signature_delta before content_block_stop.
 		if *contentStarted || *reasoningStarted || *toolUseStarted {
@@ -285,8 +300,15 @@ func (h *StreamHandler) processSSELine(
 
 	choice := chunk.Choices[0]
 
-	// Handle reasoning content deltas
+	// Handle reasoning content deltas — both standard reasoning_content
+	// and Command Code's non-standard "reasoning" field.
+	reasoningContent := ""
 	if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
+		reasoningContent = *choice.Delta.ReasoningContent
+	} else if choice.Delta.Reasoning != nil && *choice.Delta.Reasoning != "" {
+		reasoningContent = *choice.Delta.Reasoning
+	}
+	if reasoningContent != "" {
 		if !*reasoningStarted {
 			// If text was already started, close it first (no signature for text)
 			if *contentStarted {
@@ -310,7 +332,7 @@ func (h *StreamHandler) processSSELine(
 
 		delta := types.Delta{
 			Type:     "thinking_delta",
-			Thinking: *choice.Delta.ReasoningContent,
+			Thinking: reasoningContent,
 		}
 		event := types.MessageEvent{
 			Type:  "content_block_delta",
@@ -520,7 +542,21 @@ func writeSSEEvent(w http.ResponseWriter, event types.MessageEvent) error {
 	return err
 }
 
+// unescapeJSON replaces JSON escape sequences in a fast-path extracted string.
+// The fast path extracts content from raw JSON without unmarshaling, so escape
+// sequences like \n, \t, \\, \" appear as literal characters. This function
+// unescapes only the sequences that commonly appear in text content.
+func unescapeJSON(s string) string {
+	s = strings.ReplaceAll(s, "\\n", "\n")
+	s = strings.ReplaceAll(s, "\\t", "\t")
+	s = strings.ReplaceAll(s, "\\r", "\r")
+	s = strings.ReplaceAll(s, "\\\"", "\"")
+	s = strings.ReplaceAll(s, "\\\\", "\\")
+	return s
+}
+
 // generateID creates a unique identifier based on current time.
 func generateID() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
+

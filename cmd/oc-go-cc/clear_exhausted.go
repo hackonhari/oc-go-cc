@@ -154,4 +154,3 @@ func saveKeyState(path string, state *keyStateFile) error {
 	}
 	return nil
 }
-

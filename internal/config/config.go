@@ -1,7 +1,10 @@
 // Package config handles application configuration loading and validation.
 package config
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // Config holds the complete application configuration.
 //
@@ -24,8 +27,8 @@ type Config struct {
 	// On first load with a non-empty APIKey and empty APIKeys, the loader
 	// wraps it into APIKeys[0] and clears APIKey. New deployments should
 	// populate APIKeys directly.
-	APIKey       string      `json:"api_key,omitempty"`
-	APIKeys      []KeyConfig `json:"api_keys,omitempty"`
+	APIKey       string       `json:"api_key,omitempty"`
+	APIKeys      []KeyConfig  `json:"api_keys,omitempty"`
 	FreeFallback FreeFallback `json:"free_fallback,omitempty"`
 
 	Host         string `json:"host"`
@@ -50,8 +53,44 @@ type Config struct {
 	Models          map[string]ModelConfig   `json:"models,omitempty"`
 	FallbacksLegacy map[string][]ModelConfig `json:"fallbacks_legacy,omitempty"`
 
-	OpenCodeGo OpenCodeGoConfig `json:"opencode_go"`
-	Logging    LoggingConfig    `json:"logging"`
+	OpenCodeGo OpenCodeGoConfig          `json:"opencode_go"`
+	Providers  map[string]ProviderConfig `json:"providers,omitempty"`
+	Logging    LoggingConfig             `json:"logging"`
+}
+
+// ProviderConfig defines an upstream provider and its configuration.
+// When Providers is populated, each provider is a first-class routing target.
+// OpenCodeGo is still parsed for backward compatibility when Providers is absent.
+type ProviderConfig struct {
+	Name                   string      `json:"-"`                            // key in the Providers map (set by loader)
+	BaseURL                string      `json:"base_url"`
+	AnthropicBaseURL       string      `json:"anthropic_base_url,omitempty"`
+	Protocol               string      `json:"protocol"`                     // "openai" or "anthropic"
+	Models                 []string    `json:"models,omitempty"`             // model IDs this provider serves
+	APIKeys                []KeyConfig `json:"api_keys,omitempty"`           // per-provider keys
+	EnableKeyPool          bool        `json:"enable_key_pool"`              // true = use keypool rotation (opencode only)
+	DisableThinking        bool        `json:"disable_thinking,omitempty"`   // strip thinking params (Google, Groq)
+	DisableReasoningEffort bool        `json:"disable_reasoning_effort,omitempty"` // strip reasoning_effort (Groq)
+	Fallbacks              []string    `json:"fallbacks,omitempty"`           // provider-specific fallback model IDs
+}
+
+// HasProviders returns true when the providers map is populated (new schema active).
+func (c *Config) HasProviders() bool {
+	return len(c.Providers) > 0
+}
+
+// ResolveProvider returns the provider config that owns the given model ID.
+// Returns ok=false when no provider matches.
+func (c *Config) ResolveProvider(modelID string) (ProviderConfig, bool) {
+	for name, p := range c.Providers {
+		for _, m := range p.Models {
+			if m == modelID {
+				p.Name = name
+				return p, true
+			}
+		}
+	}
+	return ProviderConfig{}, false
 }
 
 // ModelConfig defines parameters for a specific model.
@@ -74,6 +113,11 @@ func (c *Config) HasNewSchema() bool {
 	return len(c.ModelConfigs) > 0
 }
 
+// isEmpty returns true when the model config has no meaningful overrides set.
+func (mc ModelConfig) isEmpty() bool {
+	return mc.Temperature == 0 && mc.MaxTokens == 0 && mc.ReasoningEffort == "" && len(mc.Thinking) == 0
+}
+
 // LookupModelConfig returns the ModelConfig for a given model_id, with
 // Provider and ModelID filled in. Returns ok=false if not configured.
 //
@@ -81,7 +125,25 @@ func (c *Config) HasNewSchema() bool {
 // Falls back to Models["default"] (legacy schema) when ModelConfigs is empty.
 func (c *Config) LookupModelConfig(modelID string) (ModelConfig, bool) {
 	if c.HasNewSchema() {
-		if cfg, ok := c.ModelConfigs[modelID]; ok {
+		// Resolve the effective model ID for config lookup.
+		// Provider-prefixed names like "deepseek/deepseek-v4-pro" are
+		// provider-specific aliases — the config belongs to the actual
+		// model (e.g. "deepseek-v4-pro"). Look up the exact name first,
+		// then fall back to the base name after the last slash.
+		lookupID := modelID
+		if cfg, ok := c.ModelConfigs[lookupID]; !ok || cfg.isEmpty() {
+			if idx := strings.LastIndex(modelID, "/"); idx >= 0 {
+				baseName := modelID[idx+1:]
+				if baseCfg, ok2 := c.ModelConfigs[baseName]; ok2 {
+					baseCfg.ModelID = modelID
+					if baseCfg.Provider == "" {
+						baseCfg.Provider = "opencode-go"
+					}
+					return baseCfg, true
+				}
+			}
+		}
+		if cfg, ok := c.ModelConfigs[lookupID]; ok {
 			cfg.ModelID = modelID
 			if cfg.Provider == "" {
 				cfg.Provider = "opencode-go"

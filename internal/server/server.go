@@ -18,6 +18,7 @@ import (
 	"oc-go-cc/internal/keypool"
 	"oc-go-cc/internal/metrics"
 	"oc-go-cc/internal/router"
+	"oc-go-cc/internal/middleware"
 	"oc-go-cc/internal/token"
 )
 
@@ -107,10 +108,26 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	modelRouter := router.NewModelRouter(cfg)
 	fallbackHandler := router.NewFallbackHandler(logger, 3, 30*time.Second)
 
+	// Build universal client when providers are configured.
+	var universalClient *client.UniversalClient
+	if cfg.HasProviders() {
+		providerPools := make(map[string]*keypool.KeyPool)
+		for name, p := range cfg.Providers {
+			if p.EnableKeyPool {
+				if name == "opencode" {
+					providerPools[name] = pool
+				}
+			}
+		}
+		universalClient = client.NewUniversalClient(cfg.Providers, providerPools, classifier, openCodeClient.HTTPClient())
+		logger.Info("universal client initialized", "providers", universalClient.ProviderNames())
+	}
+
 	// Create handlers.
 	messagesHandler := handlers.NewMessagesHandler(
 		cfg,
 		openCodeClient,
+		universalClient,
 		modelRouter,
 		fallbackHandler,
 		tokenCounter,
@@ -138,11 +155,16 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		healthHandler.HandleCountTokens(w, r)
 	})
 
+	// Wrap mux with provider-path middleware.
+	// /<provider>/v1/messages → injects provider into request context,
+	// rewrites URL to /v1/messages for downstream handlers.
+	handler := middleware.ProviderPathMiddleware(universalClient)(mux)
+
 	// Create HTTP server.
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	httpSrv := &http.Server{
 		Addr:         addr,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 0, // disabled — streaming SSE may run hours/days
 		IdleTimeout:  120 * time.Second,

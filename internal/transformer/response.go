@@ -61,10 +61,18 @@ func (t *ResponseTransformer) transformContent(msg types.ChatMessage) ([]types.C
 
 	// Preserve reasoning content as a thinking block so it round-trips correctly
 	// on multi-turn tool-calling conversations.
+	// Supports both standard OpenAI reasoning_content and Command Code's
+	// non-standard "reasoning" field.
+	reasoning := ""
 	if msg.ReasoningContent != nil && *msg.ReasoningContent != "" {
+		reasoning = *msg.ReasoningContent
+	} else if msg.Reasoning != nil && *msg.Reasoning != "" {
+		reasoning = *msg.Reasoning
+	}
+	if reasoning != "" {
 		blocks = append(blocks, types.ContentBlock{
 			Type:     "thinking",
-			Thinking: *msg.ReasoningContent,
+			Thinking: reasoning,
 		})
 	}
 

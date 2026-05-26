@@ -161,6 +161,20 @@ func loadJSON(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing JSON: %w", err)
 	}
 
+	// Populate provider names from map keys and normalize base URLs —
+	// strip trailing /chat/completions and /messages so downstream
+	// code can safely append these paths without doubling.
+	if cfg.HasProviders() {
+		for name, p := range cfg.Providers {
+			p.Name = name
+			p.BaseURL = strings.TrimSuffix(p.BaseURL, "/chat/completions")
+			p.BaseURL = strings.TrimSuffix(p.BaseURL, "/messages")
+			p.AnthropicBaseURL = strings.TrimSuffix(p.AnthropicBaseURL, "/chat/completions")
+			p.AnthropicBaseURL = strings.TrimSuffix(p.AnthropicBaseURL, "/messages")
+			cfg.Providers[name] = p
+		}
+	}
+
 	return &cfg, nil
 }
 
@@ -229,7 +243,11 @@ func applyDefaults(cfg *Config) {
 // validate checks that all required configuration fields are present.
 // Post-migration, at least one key must be present in APIKeys (legacy
 // APIKey is allowed only as a transient field cleared by migrateLegacyAPIKey).
+// When providers are configured, keys are per-provider — skip global key check.
 func validate(cfg *Config) error {
+	if cfg.HasProviders() {
+		return validateProviders(cfg)
+	}
 	if len(cfg.APIKeys) == 0 && cfg.APIKey == "" {
 		return fmt.Errorf("at least one api key is required (api_keys[] in config, or legacy api_key, or OC_GO_CC_API_KEY env var)")
 	}
@@ -239,6 +257,21 @@ func validate(cfg *Config) error {
 		}
 		if k.Account == "" {
 			return fmt.Errorf("api_keys[%d] missing account label", i)
+		}
+	}
+	return nil
+}
+
+func validateProviders(cfg *Config) error {
+	for name, p := range cfg.Providers {
+		if p.BaseURL == "" {
+			return fmt.Errorf("providers.%s: base_url is required", name)
+		}
+		if p.Protocol != "openai" && p.Protocol != "anthropic" {
+			return fmt.Errorf("providers.%s: protocol must be 'openai' or 'anthropic', got '%s'", name, p.Protocol)
+		}
+		if p.EnableKeyPool && len(p.APIKeys) == 0 {
+			return fmt.Errorf("providers.%s: enable_key_pool requires at least one api_key", name)
 		}
 	}
 	return nil

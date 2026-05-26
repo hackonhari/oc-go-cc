@@ -17,7 +17,6 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -142,109 +141,14 @@ func (c *OpenCodeClient) urlForModel(modelID string) string {
 }
 
 // doWithRotation is the rotation loop used by all public request methods.
-// It Acquire()s a key, sends the request, inspects status, and either
-// returns the response, retries with the same key (transient), or rotates
-// to the next key (hard). Returns ErrAllKeysExhausted when pool is dry.
-//
-// The body byte slice is read on each retry attempt (must be cheap to
-// re-create from the original request — that's why doWithRotation takes
-// a bodyBuilder function rather than a fixed slice).
+// Delegates to the shared doRotation function.
 func (c *OpenCodeClient) doWithRotation(
 	ctx context.Context,
 	method, url string,
 	bodyBuilder func() []byte,
 	headers map[string]string,
 ) (*http.Response, error) {
-	for {
-		key, err := c.pool.Acquire()
-		if err != nil {
-			if errors.Is(err, keypool.ErrAllExhausted) {
-				return nil, ErrAllKeysExhausted
-			}
-			return nil, fmt.Errorf("acquire key: %w", err)
-		}
-
-		// Inner loop handles same-key transient retries.
-		transientAttempts := 0
-		for {
-			body := bodyBuilder()
-			httpReq, err := http.NewRequestWithContext(ctx, method, url, bytes.NewReader(body))
-			if err != nil {
-				return nil, fmt.Errorf("build request: %w", err)
-			}
-			httpReq.Header.Set("Content-Type", "application/json")
-			httpReq.Header.Set("Authorization", "Bearer "+key.Token)
-			for k, v := range headers {
-				httpReq.Header.Set(k, v)
-			}
-
-			resp, err := c.httpClient.Do(httpReq)
-			if err != nil {
-				return nil, fmt.Errorf("request failed: %w", err)
-			}
-
-			// Success path.
-			if resp.StatusCode < 400 {
-				return resp, nil
-			}
-
-			// 5xx upstream errors: not the key's fault. Return as-is.
-			if resp.StatusCode >= 500 {
-				return resp, nil
-			}
-
-			// 401 / 429 → classifier path.
-			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
-				respBody, _ := io.ReadAll(resp.Body)
-				_ = resp.Body.Close()
-
-				dec := c.classifier.OnUpstreamError(&http.Response{
-					StatusCode: resp.StatusCode,
-					Header:     resp.Header,
-				}, respBody)
-
-				switch dec.Class {
-				case keypool.DecisionTransient:
-					transientAttempts++
-					if transientAttempts > maxTransientRetries {
-						// Escalate to hard rotation, but with SHORT TTL — this
-						// is not a real upstream exhaustion signal. dec.ResetDate
-						// is zero for Transient decisions; using it would mark
-						// the key permanently dead. See cycle 2 fix.
-						_ = c.pool.MarkExhausted(
-							key.Token,
-							time.Now().Add(transientEscalationTTL),
-							"transient_retries_exhausted",
-						)
-						break // breaks inner loop, outer loop Acquire()s next key
-					}
-					c.pool.MarkTransient(key.Token, dec.RetryAfter, dec.Reason)
-					// Honor Retry-After backoff before retrying same key.
-					if dec.RetryAfter > 0 {
-						select {
-						case <-time.After(dec.RetryAfter):
-						case <-ctx.Done():
-							return nil, ctx.Err()
-						}
-					}
-					continue // retry same key
-
-				case keypool.DecisionHard:
-					_ = c.pool.MarkExhausted(key.Token, dec.ResetDate, dec.Reason)
-					break // breaks inner loop, outer loop Acquire()s next key
-
-				default:
-					return resp, fmt.Errorf("unknown decision class: %v", dec.Class)
-				}
-				break // unreachable but quiet linter
-			}
-
-			// Other 4xx (400, 403, 404, etc.) — likely bad request shape, not key issue.
-			// Return as-is for caller to surface to client.
-			return resp, nil
-		}
-		// Inner loop broke (hard rotation) — fall through to outer loop's next Acquire().
-	}
+	return doRotation(ctx, method, url, bodyBuilder, headers, c.pool, c.classifier, c.httpClient)
 }
 
 // ChatCompletion sends an OpenAI-format chat completion request with
@@ -418,6 +322,9 @@ func (c *OpenCodeClient) FreeOnlySendAnthropic(
 	}
 	return c.freeResolver.ResolveAnthropic(ctx, body, stream, "forced")
 }
+
+// HTTPClient returns the shared HTTP client used by this client.
+func (c *OpenCodeClient) HTTPClient() *http.Client { return c.httpClient }
 
 // IsAllExhausted reports whether err signals that the paid pool is dry
 // (handler should engage free-fallback).

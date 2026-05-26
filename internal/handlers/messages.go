@@ -26,7 +26,8 @@ import (
 // MessagesHandler handles /v1/messages requests.
 type MessagesHandler struct {
 	config              *config.Config
-	client              *client.OpenCodeClient
+	client              *client.OpenCodeClient  // legacy client (backward compat)
+	universalClient     *client.UniversalClient // multi-provider dispatch (new)
 	modelRouter         *router.ModelRouter
 	fallbackHandler     *router.FallbackHandler
 	requestTransformer  *transformer.RequestTransformer
@@ -132,6 +133,7 @@ func (h *MessagesHandler) streamHeartbeat(ctx context.Context, rw *responseWrite
 func NewMessagesHandler(
 	cfg *config.Config,
 	openCodeClient *client.OpenCodeClient,
+	universalClient *client.UniversalClient,
 	modelRouter *router.ModelRouter,
 	fallbackHandler *router.FallbackHandler,
 	tokenCounter *token.Counter,
@@ -140,6 +142,7 @@ func NewMessagesHandler(
 	return &MessagesHandler{
 		config:              cfg,
 		client:              openCodeClient,
+		universalClient:     universalClient,
 		modelRouter:         modelRouter,
 		fallbackHandler:     fallbackHandler,
 		requestTransformer:  transformer.NewRequestTransformer(),
@@ -151,6 +154,46 @@ func NewMessagesHandler(
 		requestIDGen:        middleware.NewRequestIDGenerator(),
 		metrics:             metrics,
 	}
+}
+
+// resolveProviderClient returns the ProviderClient for a model if multi-provider
+// is configured. Returns nil when legacy OpenCodeClient should be used.
+//
+// Resolution order:
+//  1. Provider from URL path (set by /<provider>/v1/messages routing) — the
+//     authoritative source. When present, routes directly to that provider.
+//  2. Exact model match in any provider's model list (e.g. "deepseek-v4-pro" →
+//     opencode, "deepseek/deepseek-v4-pro" → commandcode)
+//  3. Provider-prefix "provider/model" routing (fallback for bare /v1/messages)
+//  4. Returns nil when no provider is configured for this model
+func (h *MessagesHandler) resolveProviderClient(r *http.Request, modelID string) (*client.ProviderClient, string) {
+	if h.universalClient == nil {
+		return nil, modelID
+	}
+	// Step 1: provider from URL path — the definitive routing signal.
+	if provName := middleware.ProviderFromContext(r.Context()); provName != "" {
+		pc, err := h.universalClient.Route(provName)
+		if err == nil {
+			return pc, modelID
+		}
+	}
+	// Step 2: exact model match in provider model lists.
+	pc, err := h.universalClient.RouteByModel(modelID)
+	if err == nil {
+		return pc, modelID
+	}
+	// Step 3: provider-prefix routing — "provider/model" format.
+	if i := strings.Index(modelID, "/"); i > 0 {
+		provName := modelID[:i]
+		cleanModel := modelID[i+1:]
+		if h.universalClient.HasProvider(provName) {
+			pc, err := h.universalClient.Route(provName)
+			if err == nil {
+				return pc, cleanModel
+			}
+		}
+	}
+	return nil, modelID
 }
 
 // HandleMessages handles POST /v1/messages.
@@ -188,6 +231,14 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	if err := json.Unmarshal(rawBody, &anthropicReq); err != nil {
 		h.sendError(w, http.StatusBadRequest, "invalid request body", err)
 		return
+	}
+
+	// Strip Claude Code's [1m] extended-context suffix from the model name.
+	// The router already does this internally, but the raw model name is also used
+	// for provider resolution (modelToProv lookup) and upstream body replacement,
+	// both of which need the clean model name.
+	if i := strings.LastIndex(strings.ToLower(anthropicReq.Model), "[1m]"); i >= 0 && i+4 == len(anthropicReq.Model) {
+		anthropicReq.Model = anthropicReq.Model[:i]
 	}
 
 	// Validate request
@@ -261,21 +312,23 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	modelChain := routeResult.GetModelChain()
 
 	if isStreaming {
-		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, anthropicReq.Model)
 	} else {
-		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, anthropicReq.Model)
 	}
 }
 
 // handleStreaming handles a streaming request with real-time SSE proxying.
+// originalModel is the model name from the request (before router resolution),
+// used for multi-provider dispatch to ensure the correct provider is selected
+// regardless of the model router's fallback chain.
 func (h *MessagesHandler) handleStreaming(
 	w http.ResponseWriter,
 	r *http.Request,
 	anthropicReq *types.MessageRequest,
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
+	originalModel string,
 ) {
 	// Each fallback attempt needs its own context with timeout.
 	// Don't share r.Context() across fallbacks - when Claude Code retries,
@@ -338,12 +391,27 @@ func (h *MessagesHandler) handleStreaming(
 		// Transport-level timeouts handle connection hangs; clientCtx handles disconnects.
 		ctx, cancel := context.WithCancel(context.Background())
 
-		// Check if this is an Anthropic-native model (MiniMax)
-		if client.IsAnthropicModel(model.ModelID) {
-			// For MiniMax models, send raw Anthropic request to Anthropic endpoint
-			// But we need to replace the model name in the raw body
-			modelBody := replaceModelInRawBody(rawBody, model.ModelID)
-			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID); err != nil {
+		// Resolve provider client using the ORIGINAL requested model name.
+		// The model router may have resolved to a different model (fallback),
+		// but provider routing needs the original name to find the correct
+		// upstream.
+		pc, cleanModel := h.resolveProviderClient(r, originalModel)
+		if pc != nil {
+			originalModel = cleanModel
+		}
+
+		// Check if this is an Anthropic-native model (MiniMax, native endpoint providers).
+		// Use originalModel for provider dispatch, but keep model.ModelID for
+		// the anthropic-native path (MiniMax still uses its own model IDs).
+		if client.IsAnthropicModel(model.ModelID) || (pc != nil && effectiveProtocol(pc, originalModel) == "anthropic") {
+			// Use the original model name when routing via multi-provider,
+			// otherwise use the model chain's model ID (legacy path).
+			effectiveModel := model.ModelID
+			if pc != nil {
+				effectiveModel = originalModel
+			}
+			modelBody := replaceModelInRawBody(rawBody, effectiveModel)
+			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID, pc); err != nil {
 				cancel()
 				// Check if this was a client disconnect
 				if clientCtx.Err() == context.Canceled {
@@ -360,16 +428,27 @@ func (h *MessagesHandler) handleStreaming(
 			return
 		}
 
-		// For OpenAI-compatible models, transform and send to OpenAI endpoint
-		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
+		// For OpenAI-compatible models, apply per-provider flags then transform.
+		// Both executeViaProvider (non-streaming) and this path must agree on
+		// which fields to strip — disable_thinking and disable_reasoning_effort.
+		effectiveModel := model
+		if pc != nil {
+			if pc.DisableThinking() {
+				effectiveModel.Thinking = nil
+			}
+			if pc.DisableReasoningEffort() {
+				effectiveModel.ReasoningEffort = ""
+			}
+		}
+		openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, effectiveModel)
 		if err != nil {
 			cancel()
 			h.logger.Warn("request transform failed", "model", model.ModelID, "error", err)
 			continue
 		}
 
-		// Get streaming body from upstream
-		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq)
+		// Get streaming body — use ProviderClient if available, else legacy client
+		streamBody, err := h.getStreamingBody(ctx, pc, model.ModelID, openaiReq)
 		if err != nil {
 			cancel()
 			// Check if this was a client disconnect (context canceled)
@@ -444,19 +523,58 @@ func replaceModelInRawBody(rawBody json.RawMessage, modelID string) json.RawMess
 	return rawBody
 }
 
+// getStreamingBody returns a streaming response body from either the
+// ProviderClient (multi-provider path) or the legacy OpenCodeClient.
+func (h *MessagesHandler) getStreamingBody(
+	ctx context.Context,
+	pc *client.ProviderClient,
+	modelID string,
+	req *types.ChatCompletionRequest,
+) (io.ReadCloser, error) {
+	if pc != nil {
+		body, err := json.Marshal(req)
+		if err != nil {
+			return nil, fmt.Errorf("marshal request: %w", err)
+		}
+		return pc.GetStreamingBody(ctx, pc.BaseURL()+"/chat/completions", body)
+	}
+	return h.client.GetStreamingBody(ctx, modelID, req)
+}
+
 // handleAnthropicStreaming sends a raw Anthropic request to the Anthropic endpoint.
+// When pc is non-nil (multi-provider path), uses the ProviderClient with its
+// configured AnthropicBaseURL; otherwise falls back to the legacy client.
 func (h *MessagesHandler) handleAnthropicStreaming(
 	ctx context.Context,
 	w http.ResponseWriter,
 	rawBody json.RawMessage,
 	modelID string,
+	pc *client.ProviderClient,
 ) error {
 	// Debug: Log what we're sending
 	h.logger.Debug("sending anthropic streaming request",
 		"model_id", modelID,
 		"body_preview", string(rawBody)[:min(len(rawBody), 200)])
 
-	// Send raw Anthropic request to Anthropic endpoint
+	// Use ProviderClient for multi-provider path.
+	if pc != nil {
+		url := pc.BaseURL() + "/messages"
+		resp, err := pc.Do(ctx, http.MethodPost, url, rawBody, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		_, err = io.Copy(w, resp.Body)
+		if err != nil {
+			if ctx.Err() == context.Canceled {
+				return transformer.ErrClientDisconnected
+			}
+			return fmt.Errorf("failed to copy response: %w", err)
+		}
+		return nil
+	}
+
+	// Send raw Anthropic request to Anthropic endpoint via legacy client
 	// Use ctx so cancellation propagates when client disconnects
 	resp, err := h.client.SendAnthropicRequest(ctx, rawBody, true)
 	if err != nil {
@@ -507,19 +625,45 @@ func (h *MessagesHandler) handleNonStreaming(
 	anthropicReq *types.MessageRequest,
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
+	originalModel string,
 ) {
 	ctx := r.Context()
 	startTime := time.Now()
 
+	h.logger.Info("routing via provider", "requested_model", originalModel, "resolved_chain", len(modelChain))
+
+	// Resolve provider client from the ORIGINAL model name (not the router-resolved
+	// model which may have fallen back to default). Once resolved, the same
+	// provider is used for all fallback attempts in the chain.
+	// Supports provider-prefix routing: "provider/model" selects provider,
+	// and cleanModel strips the prefix for upstream use.
+	pc, cleanModel := h.resolveProviderClient(r, originalModel)
+	if pc != nil {
+		originalModel = cleanModel
+		h.logger.Info("multi-provider dispatch", "provider", pc.Name(), "protocol", pc.Protocol())
+	}
+
+	// Build effective chain: when multi-provider is active, use only the
+	// first model (primary). The fallback chain contains opencode models
+	// that shouldn't be tried against other providers.
+	effectiveChain := modelChain
+	if pc != nil {
+		effectiveChain = modelChain[:1]
+	}
+
 	result, responseBody, err := h.fallbackHandler.ExecuteWithFallback(
 		ctx,
-		modelChain,
+		effectiveChain,
 		func(ctx context.Context, model config.ModelConfig) ([]byte, error) {
-			// Check if this is an Anthropic-native model (MiniMax)
+			// When multi-provider is active, use the resolved provider client
+			// with the ORIGINAL model name (preserved from the user request).
+			if pc != nil {
+				return h.executeViaProvider(ctx, anthropicReq, rawBody, model, pc, originalModel)
+			}
+			// Legacy path: use model chain's model ID directly
 			if client.IsAnthropicModel(model.ModelID) {
 				return h.executeAnthropicRequest(ctx, rawBody, model)
 			}
-			// Otherwise use OpenAI transformation
 			return h.executeOpenAIRequest(ctx, anthropicReq, model)
 		},
 	)
@@ -542,6 +686,120 @@ func (h *MessagesHandler) handleNonStreaming(
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(responseBody)
+}
+
+// effectiveProtocol returns the protocol to use for a model.
+// Some providers (commandcode) serve both Anthropic-native models (Claude)
+// and OpenAI models (DeepSeek, Qwen etc.) through different endpoints.
+// Claude models must use the Anthropic path regardless of provider config.
+func effectiveProtocol(pc *client.ProviderClient, modelID string) string {
+	if strings.HasPrefix(modelID, "claude-") {
+		return "anthropic"
+	}
+	return pc.Protocol()
+}
+
+// executeViaProvider sends a request through the ProviderClient (multi-provider path).
+// Uses originalModel (preserved from the user request) as the model ID sent upstream,
+// while using model's config for temperature/max_tokens/thinking parameters.
+func (h *MessagesHandler) executeViaProvider(
+	ctx context.Context,
+	anthropicReq *types.MessageRequest,
+	rawBody json.RawMessage,
+	model config.ModelConfig,
+	pc *client.ProviderClient,
+	originalModel string,
+) ([]byte, error) {
+	if effectiveProtocol(pc, originalModel) == "anthropic" {
+		// Anthropic-native: pass through with model name replaced
+		modifiedBody := replaceModelInRawBody(rawBody, originalModel)
+		return h.sendAnthropicViaProvider(ctx, modifiedBody, originalModel, pc)
+	}
+	// OpenAI-format: translate Anthropic→OpenAI, use originalModel as upstream model ID.
+	// Build a model config that inherits temperature/max_tokens/thinking from the
+	// router-resolved model but uses the original model name for upstream routing.
+	effectiveModel := model
+	effectiveModel.ModelID = originalModel
+		// Per-provider transformer flags: each flag targets only its namesake field.
+		// disable_thinking strips the Anthropic-format "thinking" field.
+		// disable_reasoning_effort strips the OpenAI-standard "reasoning_effort" field.
+		// They are independent: e.g. Google keeps reasoning_effort but strips thinking.
+		if pc.DisableThinking() {
+			effectiveModel.Thinking = nil
+		}
+		if pc.DisableReasoningEffort() {
+			effectiveModel.ReasoningEffort = ""
+		}
+		reqCopy := *anthropicReq
+		reqCopy.Model = originalModel
+		openaiReq, err := h.requestTransformer.TransformRequest(&reqCopy, effectiveModel)
+		// Post-transform: catch defaults the transformer may have added.
+		if pc.DisableThinking() {
+			openaiReq.Thinking = nil
+		}
+		if pc.DisableReasoningEffort() {
+			openaiReq.ReasoningEffort = nil
+		}
+	if err != nil {
+		return nil, fmt.Errorf("request transform failed: %w", err)
+	}
+	body, err := json.Marshal(openaiReq)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	// Use key-pool rotation when the provider has one (opencode),
+	// otherwise use simple API-key forwarding.
+	var resp *http.Response
+	if pc.HasKeyPool() {
+		resp, err = pc.DoWithRotation(ctx, http.MethodPost, pc.BaseURL()+"/chat/completions",
+			func() []byte { return body }, nil)
+	} else {
+		resp, err = pc.Do(ctx, http.MethodPost, pc.BaseURL()+"/chat/completions", body, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= http.StatusBadRequest {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	var openaiResp types.ChatCompletionResponse
+	if err := json.Unmarshal(respBytes, &openaiResp); err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}
+	anthropicResp, err := h.responseTransformer.TransformResponse(&openaiResp, originalModel)
+	if err != nil {
+		return nil, fmt.Errorf("transform response: %w", err)
+	}
+	return json.Marshal(anthropicResp)
+}
+
+// sendAnthropicViaProvider sends a raw Anthropic request through a ProviderClient.
+func (h *MessagesHandler) sendAnthropicViaProvider(
+	ctx context.Context,
+	rawBody json.RawMessage,
+	modelID string,
+	pc *client.ProviderClient,
+) ([]byte, error) {
+	resp, err := pc.Do(ctx, http.MethodPost, pc.BaseURL()+"/messages", rawBody, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= http.StatusBadRequest {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+	return body, nil
 }
 
 // executeAnthropicRequest executes a request to the Anthropic endpoint (for MiniMax models).

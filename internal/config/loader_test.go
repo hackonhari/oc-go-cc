@@ -354,6 +354,167 @@ func TestValidate_RejectsEmptyKeyEntries(t *testing.T) {
 	}
 }
 
+func TestMultiProvider_LoadAndResolve(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	cfgJSON := `{
+		"providers": {
+			"opencode": {
+				"base_url": "https://opencode.ai/zen/go/v1/chat/completions",
+				"protocol": "openai",
+				"models": ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.6"],
+				"api_keys": [{"token": "sk-oc-1", "account": "primary"}],
+				"enable_key_pool": true
+			},
+			"commandcode": {
+				"base_url": "https://api.commandcode.ai/provider/v1",
+				"protocol": "openai",
+				"models": ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"],
+				"api_keys": [{"token": "user_cc_1", "account": "primary"}]
+			},
+			"kimi": {
+				"base_url": "https://api.kimi.com/coding",
+				"anthropic_base_url": "https://api.kimi.com/coding",
+				"protocol": "anthropic",
+				"models": ["kimi-for-coding", "kimi-k2.6"]
+			}
+		}
+	}`
+
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("failed to write test config: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer func() { _ = os.Unsetenv("OC_GO_CC_CONFIG") }()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if !cfg.HasProviders() {
+		t.Fatal("HasProviders() = false, want true")
+	}
+
+	// Provider names populated from map keys.
+	if cfg.Providers["opencode"].Name != "opencode" {
+		t.Errorf("opencode.Name = %q, want opencode", cfg.Providers["opencode"].Name)
+	}
+	if cfg.Providers["commandcode"].Name != "commandcode" {
+		t.Errorf("commandcode.Name = %q, want commandcode", cfg.Providers["commandcode"].Name)
+	}
+	if cfg.Providers["kimi"].Name != "kimi" {
+		t.Errorf("kimi.Name = %q, want kimi", cfg.Providers["kimi"].Name)
+	}
+
+	// ResolveProvider
+	pc, ok := cfg.ResolveProvider("deepseek-v4-pro")
+	if !ok {
+		t.Fatal("ResolveProvider(deepseek-v4-pro) not found")
+	}
+	if pc.Name != "opencode" {
+		t.Errorf("ResolveProvider resolved to %q, want opencode", pc.Name)
+	}
+
+	pc, ok = cfg.ResolveProvider("deepseek/deepseek-v4-pro")
+	if !ok {
+		t.Fatal("ResolveProvider(deepseek/deepseek-v4-pro) not found")
+	}
+	if pc.Name != "commandcode" {
+		t.Errorf("ResolveProvider resolved to %q, want commandcode", pc.Name)
+	}
+
+	pc, ok = cfg.ResolveProvider("kimi-for-coding")
+	if !ok {
+		t.Fatal("ResolveProvider(kimi-for-coding) not found")
+	}
+	if pc.Name != "kimi" {
+		t.Errorf("ResolveProvider resolved to %q, want kimi", pc.Name)
+	}
+
+	// Unknown model
+	_, ok = cfg.ResolveProvider("nonexistent-model")
+	if ok {
+		t.Fatal("ResolveProvider(nonexistent-model) should not be found")
+	}
+}
+
+func TestMultiProvider_Validation(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	tests := []struct {
+		name    string
+		json    string
+		wantErr string
+	}{
+		{
+			name:    "missing base_url",
+			json:    `{"providers": {"bad": {"protocol": "openai"}}}`,
+			wantErr: "base_url is required",
+		},
+		{
+			name:    "invalid protocol",
+			json:    `{"providers": {"bad": {"base_url": "https://x.com", "protocol": "grpc"}}}`,
+			wantErr: "protocol must be 'openai' or 'anthropic'",
+		},
+		{
+			name:    "key pool without keys",
+			json:    `{"providers": {"bad": {"base_url": "https://x.com", "protocol": "openai", "enable_key_pool": true}}}`,
+			wantErr: "enable_key_pool requires at least one api_key",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(cfgPath, []byte(tt.json), 0644); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+			defer func() { _ = os.Unsetenv("OC_GO_CC_CONFIG") }()
+
+			_, err := Load()
+			if err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want containing %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestMultiProvider_BackwardCompat(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+
+	// Legacy config — no providers field.
+	cfgJSON := `{"api_key": "sk-legacy", "host": "127.0.0.1", "opencode_go": {"base_url": "https://custom/v1"}}`
+	if err := os.WriteFile(cfgPath, []byte(cfgJSON), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_ = os.Setenv("OC_GO_CC_CONFIG", cfgPath)
+	defer func() { _ = os.Unsetenv("OC_GO_CC_CONFIG") }()
+	oldEnvKey := os.Getenv("OC_GO_CC_API_KEY")
+	_ = os.Unsetenv("OC_GO_CC_API_KEY")
+	defer func() { _ = os.Setenv("OC_GO_CC_API_KEY", oldEnvKey) }()
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+
+	if cfg.HasProviders() {
+		t.Fatal("HasProviders() = true for legacy config, want false")
+	}
+	if cfg.OpenCodeGo.BaseURL != "https://custom/v1" {
+		t.Errorf("BaseURL = %q, want https://custom/v1", cfg.OpenCodeGo.BaseURL)
+	}
+}
+
 func TestExpandHome(t *testing.T) {
 	home, _ := os.UserHomeDir()
 

@@ -31,7 +31,7 @@ type RouteResult struct {
 // Resolution order:
 //  1. Check `model_aliases` map (e.g. "sonnet" -> "deepseek-v4-pro")
 //  2. Check Anthropic-style names (claude-3-5-sonnet, claude-haiku, etc.) for sonnet/opus/haiku patterns
-//  3. Check if the requested name matches a known OpenCode Go model_id directly
+//  4. Check if the requested name matches a known OpenCode Go model_id directly
 //  4. Fall back to default_model from config (when configured)
 //  5. Return found=false to signal scenario-based routing should be used (legacy)
 //
@@ -54,7 +54,21 @@ func (r *ModelRouter) ResolveExplicitModel(requested string) (config.ModelConfig
 		}
 	}
 
-	// 2. Anthropic-style name patterns -> map via aliases if defined
+	// 2. Check provider models BEFORE Anthropic pattern matching.
+	// When multi-provider is configured, a model like "claude-sonnet-4-6"
+	// should route directly to the provider that owns it, not get caught
+	// by the "sonnet" pattern and mapped to an opencode alias.
+	if r.config.HasProviders() && lower != "" {
+		for _, prov := range r.config.Providers {
+			for _, m := range prov.Models {
+				if strings.EqualFold(m, lower) {
+					return r.buildModelConfig(lower), true
+				}
+			}
+		}
+	}
+
+	// 3. Anthropic-style name patterns -> map via aliases if defined
 	if r.config.ModelAliases != nil && lower != "" {
 		switch {
 		case strings.Contains(lower, "sonnet"):
@@ -72,12 +86,17 @@ func (r *ModelRouter) ResolveExplicitModel(requested string) (config.ModelConfig
 		}
 	}
 
-	// 3. Direct model_id match (e.g. user passes "deepseek-v4-pro" or "kimi-k2.6")
+	// 4. Direct model_id match (e.g. user passes "deepseek-v4-pro" or "kimi-k2.6")
 	if lower != "" && isKnownModelID(lower) {
 		return r.buildModelConfig(lower), true
 	}
 
-	// 4. Fall back to default_model when configured (new schema only)
+	// (moved to step 2 above)
+	// direct resolution. This prevents models
+	// like "gemini-3.1-flash-lite" from being caught by Anthropic patterns.
+	// Provider model check moved to step 2 above
+
+	// 5. Fall back to default_model when configured (new schema only)
 	if r.config.HasNewSchema() && r.config.DefaultModel != "" {
 		return r.buildModelConfig(r.config.DefaultModel), true
 	}
